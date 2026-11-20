@@ -3,11 +3,14 @@
 import asyncio
 import copy
 import json
+import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from httpx import ASGITransport, AsyncClient
 
@@ -202,10 +205,16 @@ class ProductTests(unittest.IsolatedAsyncioTestCase):
         await self.send(client,"city-other","明天有乙公司面试。")
         (await client.delete("/api/memories/residence")).raise_for_status()
         reopened = await self.client(model)
-        await self.send(reopened,"city-probe-2","晚上好。")
+        await self.send(reopened,"city-neutral-probe","晚上好。")
+        neutral = json.dumps(contexts[-1],ensure_ascii=False)
+        self.assertNotIn("广州",neutral)
+        self.assertNotIn("乙公司",neutral)
+        await self.send(reopened,"city-probe-2","接下来的面试是什么时候？")
         payload = json.dumps(contexts[-1],ensure_ascii=False)
         self.assertNotIn("广州",payload)
         self.assertIn("乙公司",payload)
+        await self.send(reopened,"city-probe-related","想聊聊乙公司的面试。")
+        self.assertIn("乙公司",json.dumps(contexts[-1],ensure_ascii=False))
         facts = await self.get_json(reopened,"/api/memories")
         self.assertEqual({e["label"]:e["status"] for e in facts["events"]},
                          {"广州面试":"muted","乙公司面试":"pending"})
@@ -216,7 +225,7 @@ class ProductTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("广州" in m["text"] for m in opened["messages"] if m["role"]=="user"))
         event = next(e for e in facts["events"] if e["label"]=="乙公司面试")
         (await reopened.delete(f"/api/memories/events/{event['event_id']}")).raise_for_status()
-        await self.send(reopened,"city-probe-3","好呀。")
+        await self.send(reopened,"city-probe-3","接下来还有面试吗？")
         self.assertNotIn("乙公司",json.dumps(contexts[-1],ensure_ascii=False))
 
     async def test_incomplete_head_blank_summary_and_late_reply(self):
@@ -248,7 +257,6 @@ class ProductTests(unittest.IsolatedAsyncioTestCase):
 
         fail_head = False
         await self.send(client, "delayed-head", "delayed head")
-        await self.send(client, "trigger-blank", "check the delayed reply")
         await asyncio.wait_for(blank_attempt.wait(), WAIT)
         self.assertEqual(self.saved()[2:], (0, ""))
 
@@ -457,3 +465,334 @@ class ProductTests(unittest.IsolatedAsyncioTestCase):
         follow = await reopened_again.post("/api/chat/open", json={"demo_date": INTERVIEW_DAY})
         follow.raise_for_status()
         self.assertFalse(follow.json()["followup"])
+
+    async def test_summary_no_change_advances_retaining_prior_and_later_meaningful_batch(self):
+        results = [
+            {"summary": "prior significant context"},
+            {"no_summary": "true"},  # Boolean required.
+            {"summary": " \n "},
+            {"no_summary": True},
+            {"summary": "later significant context"},
+        ]
+        attempts = []
+        queued = asyncio.Queue()
+
+        async def model(setup, key, context):
+            if context["type"] == "summary":
+                attempts.append(copy.deepcopy(context))
+                index = len(attempts) - 1
+                queued.put_nowait(index)
+                return results[index] if index < len(results) else {"no_summary": True}
+            return {"reply":"recorded", "patches":[]}
+
+        client = await self.client(model)
+        next_id = 0
+
+        async def send_turns(count):
+            nonlocal next_id
+            for _ in range(count):
+                await self.send(client, f"no-summary-turn-{next_id}", f"turn {next_id}")
+                next_id += 1
+
+        async def wait_for_batch(index):
+            self.assertEqual(await asyncio.wait_for(queued.get(), WAIT), index)
+            return self.saved()[2:]
+
+        await send_turns(RECENT_TURNS + SUMMARY_BATCH)
+        covered, saved = await wait_for_batch(0)
+        self.assertGreater(covered, 0)
+        self.assertEqual(saved, results[0]["summary"])
+
+        await send_turns(SUMMARY_BATCH)
+        self.assertEqual(await wait_for_batch(1), (covered, saved))
+        await send_turns(1)
+        self.assertEqual(await wait_for_batch(2), (covered, saved))
+        client = await self.client(model)
+        await send_turns(1)
+        next_covered, same_summary = await wait_for_batch(3)
+        self.assertGreater(next_covered, covered)
+        self.assertEqual(same_summary, saved)
+        self.assertEqual(attempts[1]["turns"], attempts[2]["turns"])
+        self.assertEqual(attempts[2]["turns"], attempts[3]["turns"])
+
+        await send_turns(SUMMARY_BATCH - 2)
+        final_covered, final_summary = await wait_for_batch(4)
+        self.assertGreater(final_covered, next_covered)
+        self.assertEqual(final_summary, results[4]["summary"])
+        self.assertEqual(attempts[-1]["previous_summary"], saved)
+
+    async def test_paid_summary_failure_retries_same_batch_once_then_waits_for_restart(self):
+        calls = []
+        loop = asyncio.get_running_loop()
+        original_time = loop.time
+        elapsed = 0
+        recover = False
+
+        async def model(setup, key, context):
+            if context["type"] == "summary":
+                calls.append(tuple(turn["source_id"] for turn in context["turns"]))
+                if not recover:
+                    raise ModelFailure("offline paid-provider simulation")
+                return {"summary":"recovered after restart"}
+            return {"reply":"recorded", "patches":[]}
+
+        client = await self.client(model)
+        setup = await self.get_json(client, "/api/settings")
+        result = await client.put("/api/settings", json={**setup,"mode":"openai","online_summary":True})
+        result.raise_for_status()
+        idx = 0
+
+        async def send_turn():
+            nonlocal idx
+            await self.send(client, f"paid-backoff-{idx}", f"paid summary test turn {idx}")
+            idx += 1
+
+        with (patch.object(loop, "time", lambda: original_time() + elapsed),
+              patch.object(loop, "slow_callback_duration", float("inf"))):
+            for _ in range(RECENT_TURNS + SUMMARY_BATCH):
+                await send_turn()
+            await self.eventually(lambda: len(calls) == 1)
+            self.assertEqual(self.saved()[2:], (0, ""))
+            elapsed += 119
+            await send_turn()
+            self.assertEqual(len(calls), 1, "must cool down for two minutes")
+            elapsed += 2
+            await send_turn()
+            await self.eventually(lambda: len(calls) == 2)
+            self.assertEqual(calls[0], calls[1])
+            self.assertEqual(self.saved()[2:], (0, ""))
+            elapsed += 600
+            for _ in range(3):
+                await send_turn()
+            self.assertEqual(len(calls), 2, "the failed batch must stop retrying in this process")
+
+            recover = True
+            client = await self.client(model)
+            await send_turn()
+            await self.eventually(lambda: self.saved()[2] > 0)
+            self.assertEqual(calls, [calls[0]] * 3)
+            self.assertEqual(self.saved()[3], "recovered after restart")
+
+    async def test_two_tabs_queue_before_model_and_retry_pending_across_restart(self):
+        started, release, second_started = (asyncio.Event() for _ in range(3))
+        invocations = []
+        first_message, second_message = "first tab text", "second tab text"
+
+        async def model(setup, key, context):
+            invocations.append(context["message"])
+            if context["message"] == first_message:
+                started.set()
+                await release.wait()
+            if context["message"] == second_message:
+                self.assertEqual(context["recent"], [
+                    {"role":"user", "text":first_message},
+                    {"role":"assistant", "text":"answered"},
+                ])
+                second_started.set()
+                raise ModelFailure("leave second text pending for restart")
+            return {"reply": "answered", "patches": []}
+
+        app = create_app(self.db, model_call=model, clock=lambda: START)
+        first, second = await self.client(model, app), await self.client(model, app)
+        first_task = asyncio.create_task(self.send(first, "queue-first-tab", first_message, expected=None))
+        second_task = None
+        duplicate_task = None
+        try:
+            await asyncio.wait_for(started.wait(), WAIT)
+            second_task = asyncio.create_task(self.send(second, "queue-second-tab", second_message, expected=None))
+            async with asyncio.timeout(WAIT):
+                while True:
+                    rows = (await self.get_json(second, "/api/chat"))["messages"]
+                    if len(rows) == 2:
+                        break
+                    await asyncio.sleep(0.01)
+            self.assertEqual([(m["text"],m["delivery_state"]) for m in rows],
+                             [(first_message,"pending"),(second_message,"pending")])
+            self.assertEqual(invocations, [first_message])
+            read_after_restart = await self.client(model)
+            self.assertEqual(rows, (await self.get_json(read_after_restart, "/api/chat"))["messages"])
+            await asyncio.wait_for(self.send(second, "queue-second-tab", "different text", expected=409), WAIT)
+            duplicate_task = asyncio.create_task(self.send(second, "queue-second-tab", second_message, expected=None))
+            self.assertEqual(len((await self.get_json(first, "/api/chat"))["messages"]), 2)
+            self.assertFalse(second_started.is_set())
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*(t for t in (first_task,second_task,duplicate_task)
+                                                    if t is not None)), WAIT)
+        await asyncio.wait_for(second_started.wait(), WAIT)
+        self.assertEqual(invocations, [first_message, second_message])
+        self.assertEqual(first_task.result().status_code, 200)
+        self.assertEqual(second_task.result().status_code, 503)
+        self.assertEqual(duplicate_task.result().status_code, 503)
+
+        async def recovered_model(setup, key, context):
+            self.assertEqual(context["message"], second_message)
+            return {"reply":"recovered", "patches":[]}
+
+        restarted = await self.client(recovered_model)
+        await self.send(restarted, "queue-second-tab", second_message)
+        await self.send(restarted, "queue-second-tab", second_message)
+        all_rows = (await self.get_json(restarted, "/api/chat"))["messages"]
+        self.assertEqual(len(all_rows), 4)
+        self.assertEqual([m["id"] for m in all_rows if m["role"]=="user"], [r["id"] for r in rows])
+        self.assertEqual(sum(m["reply_to"]==rows[-1]["id"] for m in all_rows), 1)
+
+    async def test_hallucinated_facts_cannot_overwrite_literal_evidence(self):
+        async def model(setup, key, context):
+            source = context["message"]
+            if "上海" in source or "北京" in source:
+                patches=[{"kind":"fact","key":"residence","value":"上海" if "上海" in source else "北京",
+                          "quote":next(clause for clause in ("住在上海","搬到上海","住在北京") if clause in source)}]
+            else:
+                patches=[{"kind":"fact","key":"food:香菜","value":"不吃香菜","quote":"不吃香菜"}]
+            return {"reply":"收到","patches":patches}
+
+        client = await self.client(model)
+
+        async def facts():
+            return {f["key"]:f["value"] for f in (await self.get_json(client,"/api/memories"))["facts"]}
+
+        await self.send(client,"fact-hallucinated-empty","我可能住在上海。")
+        self.assertEqual(await facts(), {})
+        await self.send(client,"fact-actual-beijing","我住在北京。")
+        self.assertEqual(await facts(), {"residence":"北京"})
+        for i, statement in enumerate(("我可能住在上海。","我朋友住在上海。","我准备搬到上海。")):
+            await self.send(client,f"fact-hallucinated-{i}",statement)
+            self.assertEqual(await facts(), {"residence":"北京"})
+        await self.send(client,"fact-actual-move","我已经搬到上海了。")
+        await self.send(client,"fact-literal-food","我不吃香菜。")
+        self.assertEqual(await facts(), {"residence":"上海","food:香菜":"不吃香菜"})
+
+    async def test_private_posix_permissions_for_existing_database_and_wal(self):
+        if os.name != "posix":
+            self.skipTest("POSIX file-mode check")
+
+        async def model(setup,key,context):
+            return {"reply":"saved","patches":[]}
+
+        with sqlite3.connect(self.db):
+            pass
+        os.chmod(self.db, 0o644)
+        self.assertEqual(stat.S_IMODE(self.db.stat().st_mode), 0o644)
+        client = await self.client(model)
+        with sqlite3.connect(self.db) as observer:
+            observer.execute("BEGIN")
+            observer.execute("SELECT * FROM settings").fetchall()
+            await self.send(client,"database-private","sensitive text")
+            for suffix in ("","-wal","-shm"):
+                path=Path(str(self.db)+suffix)
+                self.assertTrue(path.exists(), str(path))
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode) & 0o077, 0, str(path))
+
+    async def test_opted_in_morning_meeting_followup_is_local_noon_and_one_shot(self):
+        # November 20 20:00 in Asia/Shanghai, then the next local morning/noon.
+        current = datetime(2026, 11, 20, 12, tzinfo=timezone.utc)
+        model_calls = []
+        user_text = "明早开完会我来找你，可以问我一句讲得怎样，但今晚不要再提同事那件事了"
+
+        async def model(setup, key, context):
+            model_calls.append(context["type"])
+            return {"reply":"我今晚就主动提醒你同事那件事，并且到点发消息。", "patches":[]}
+
+        client = await self.client(model, clock=lambda: current)
+        response = await self.send(client, "consented-early-meeting", user_text)
+        duplicate = await self.send(client, "consented-early-meeting", user_text)
+        self.assertEqual(response.json(), duplicate.json())
+        user, ack = response.json()["messages"]
+        self.assertEqual((ack["role"], ack["reply_to"]), ("assistant", user["id"]))
+        self.assertNotIn("同事", ack["text"])
+        self.assertNotIn("主动提醒", ack["text"])
+        self.assertNotIn("到点发消息", ack["text"])
+        self.assertRegex(ack["text"], r"回来|来找|打开|再来|来聊")
+        self.assertEqual(model_calls, ["user_message"])
+
+        entries = (await self.get_json(client, "/api/memories"))["events"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["status"], "pending")
+        self.assertEqual(entries[0]["event_date"], "2026-11-21")
+        self.assertEqual(entries[0]["not_before"], "2026-11-21T12:00")
+        self.assertNotIn("同事", entries[0]["quote"])
+
+        async def open_chat(tab):
+            response = await tab.post("/api/chat/open", json={})
+            response.raise_for_status()
+            return response.json()
+
+        current = datetime(2026, 11, 20, 13, tzinfo=timezone.utc)  # 21:00, request date.
+        self.assertFalse((await open_chat(client))["followup"])
+        current = datetime(2026, 11, 21, 3, 59, tzinfo=timezone.utc)
+        self.assertFalse((await open_chat(client))["followup"])
+        current = datetime(2026, 11, 21, 4, tzinfo=timezone.utc)
+        asked = await open_chat(client)
+        self.assertTrue(asked["followup"])
+        questions = [m["text"] for m in asked["messages"] if m["role"] == "followup"]
+        self.assertEqual(len(questions), 1)
+        self.assertIn("讲得怎样", questions[0].replace("怎么样", "怎样"))
+        self.assertNotIn("同事", questions[0])
+        self.assertLessEqual(len(questions[0]), 30)
+        self.assertEqual(sum(questions[0].count(mark) for mark in ("？", "?")), 1)
+        self.assertFalse((await open_chat(client))["followup"])
+        reopened = await self.client(model, clock=lambda: current)
+        after_restart = await open_chat(reopened)
+        self.assertFalse(after_restart["followup"])
+        self.assertEqual(sum(m["role"] == "followup" for m in after_restart["messages"]), 1)
+        self.assertEqual(model_calls, ["user_message"])
+
+    async def test_followup_unclear_clarifies_and_no_negative_or_hypothetical_opt_in(self):
+        async def model(setup, key, context):
+            return {"reply":"已经安排了，明早会主动提醒你。", "patches":[]}
+
+        client = await self.client(model)
+        for i, source in enumerate((
+            "下次我回来时，可以问我一句结果怎么样吗？",
+            "开完会我回来时，可以问我一句讲得怎样吗？",
+            "明天我回来时，可以问我一句结果怎么样吗？",
+            "明天等我回来，可以问我一句吃得怎样？",
+        )):
+            response = await self.send(client, f"unclear-followup-{i}", source)
+            reply = response.json()["messages"][-1]["text"]
+            with self.subTest(source=source):
+                self.assertRegex(reply, r"什么时候|哪天|哪件事|什么事|具体")
+                self.assertNotIn("已经安排", reply)
+                self.assertNotIn("提醒", reply)
+        for i, source in enumerate((
+            "明早开完会我来找你，不要问我讲得怎样。",
+            "如果我明早开完会来找你，你可以问我一句讲得怎样吗？",
+        )):
+            await self.send(client, f"no-followup-opt-in-{i}", source)
+        self.assertEqual((await self.get_json(client, "/api/memories"))["events"], [])
+
+    async def test_courteous_followup_request_is_saved_before_ack(self):
+        async def model(setup,key,context):
+            return {"reply":"我不能说已经登记。","patches":[]}
+
+        client=await self.client(model)
+        for i,permission in enumerate(("能不能","可不可以")):
+            r=await self.send(client,f"polite-open-request-{i}",f"明早开完会我来找你，{permission}问我一句讲得怎样？")
+            self.assertIn("明天中午后你回来",r.json()["messages"][-1]["text"])
+            data=await self.get_json(client,"/api/memories")
+            self.assertEqual(len(data["events"]),1)
+            self.assertEqual(data["events"][0]["not_before"],"2026-11-21T12:00")
+
+    async def test_generic_events_remain_day_after_through_day_fourteen(self):
+        async def model(setup, key, context):
+            return simulate(context)
+
+        client = await self.client(model)
+        for i, text in enumerate(("明天有面试。", "明天有考试。", "明天有会议。")):
+            await self.send(client, f"generic-due-event-{i}", text)
+
+        async def opens(day):
+            response = await client.post("/api/chat/open", json={"demo_date":day})
+            response.raise_for_status()
+            return response.json()["followup"]
+
+        entries = (await self.get_json(client, "/api/memories"))["events"]
+        self.assertEqual(len(entries), 3)
+        self.assertTrue(all(e["event_date"] == "2026-11-21" and not e.get("not_before") for e in entries))
+        self.assertFalse(await opens("2026-11-21"))
+        self.assertTrue(await opens("2026-11-22"))
+        self.assertTrue(await opens("2026-12-05"))
+        self.assertFalse(await opens("2026-12-06"))
+        after = (await self.get_json(client, "/api/memories"))["events"]
+        self.assertEqual(sorted(row["status"] for row in after), ["asked","asked","pending"])

@@ -25,10 +25,13 @@ CREATE TABLE IF NOT EXISTS abandoned_turns(
 def state(con):
     return dict(con.execute("SELECT epoch,floor,covered,summary FROM continuity WHERE id=1").fetchone())
 
-def retire_context(con):
+def retire_context(con, cut=None):
     # Removing passages by matching words misses paraphrases and assistant echoes.
     # Keep the original chat for the user, but start model-visible context cleanly.
-    cut = con.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
+    if cut is None:
+        cut = con.execute("SELECT COALESCE(MAX(id),0) FROM messages").fetchone()[0]
+    else:
+        cut = max(cut, state(con)["floor"])
     con.execute("UPDATE continuity SET epoch=epoch+1,floor=?,covered=?,summary='' WHERE id=1", (cut,cut))
 
 def reset_summary(con):
@@ -97,10 +100,29 @@ def compaction_input(con):
         return None
     return snap, end, data
 
+def summary_result(result):
+    """Normalize an explicit no-op or a usable summary. None signals invalid output."""
+    if not isinstance(result, dict):
+        return None
+    if set(result) == {"no_summary"} and result["no_summary"] is True:
+        return {"no_summary": True}
+    if set(result) != {"summary"}:
+        return None
+    summary = result["summary"]
+    if not isinstance(summary, str) or not summary.strip() or len(summary.encode("utf-8")) > SUMMARY_MAX:
+        return None
+    return {"summary": summary.strip()}
+
+
 def commit_summary(con, snap, end, result):
-    summary = result.get("summary") if isinstance(result,dict) else None
-    if not isinstance(summary,str) or not summary.strip() or len(summary.encode("utf-8"))>SUMMARY_MAX:
+    normalized = summary_result(result)
+    if normalized is None:
         return False
+    if normalized.get("no_summary") is True:
+        # A successful review of trivial turns advances coverage but cannot erase context.
+        return bool(con.execute("""UPDATE continuity SET covered=?
+            WHERE id=1 AND epoch=? AND covered=?""",
+            (end,snap["epoch"],snap["covered"])).rowcount)
     return bool(con.execute("""UPDATE continuity SET covered=?,summary=?
         WHERE id=1 AND epoch=? AND covered=?""",
-        (end,summary.strip(),snap["epoch"],snap["covered"])).rowcount)
+        (end,normalized["summary"],snap["epoch"],snap["covered"])).rowcount)

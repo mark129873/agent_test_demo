@@ -1,6 +1,6 @@
 """Local event evidence, correlation and SQLite persistence."""
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 
 EVENT_NAMES = {"interview":"面试","exam":"考试","meeting":"会议","appointment":"约会","birthday":"生日"}
 NAME_KEYS = {name: key for key, name in EVENT_NAMES.items()}
@@ -168,6 +168,104 @@ def event_candidates(source, day, recent=()):
                         yield ("event", key, {"date": value}, clause)
 
 
+_OPEN_REQUEST = r"来找你|再找你|回来找你|等我(?:再)?回来|(?:再|重新|下次)?打开(?:晚灯|聊天|这个聊天)|回来(?:聊天|跟你聊|时|的时候)"
+_PERMISSION = r"(?:可以|可不可以|能不能|能否|记得|请(?:你)?|到时候)问我(?:一句|一下)?|你问我(?:一句|一下)"
+_PROHIBITION = r"(?:不要|别|别再|不用|不要再|不必|(?<!可)不可以|(?<!能)不能|不想让你)(?:主动|再|来)?问我"
+_MORNING_TOMORROW = r"明早|明天(?:一早|早上|上午)"
+_OPEN_TOPICS = (
+    ("meeting", r"开完(?:了)?会|会(?:议)?开完|会议结束", r"(?:我)?(?:讲|说|汇报|分享)(?:得|的)?(?:怎么样|怎样|如何)", "讲得怎么样？"),
+    ("interview", r"面试(?:完|结束)|结束面试", r"(?:我)?面试(?:得|的)?(?:怎么样|怎样|如何)", "面试怎么样？"),
+    ("presentation", r"汇报(?:讲)?完|汇报结束|做完(?:工作)?汇报", r"(?:我)?(?:工作)?汇报(?:讲)?(?:得|的)?(?:怎么样|怎样|如何)", "汇报讲得怎么样？"),
+)
+
+
+def parse_followup_request(source, local_datetime):
+    """Recognize a scoped ask-on-open request, not a reminder or an end detector.
+
+    None means no actionable intent, {} means clarification is needed; a spec
+    carries only the literal event and permission, never nearby private topics.
+    """
+    permission = re.search(_PERMISSION, source)
+    if not permission:
+        return None
+    before = source[:permission.start()]
+    after_permission = source[permission.end():]
+    # Do not act on language presented as a quote, hypothetical or example.
+    if (re.search(ASSUME, before)
+            or re.search(_PROHIBITION, before + permission[0])
+            or re.search(r"说[：:]\s*$|(?:他说|她说|同事说|朋友说)[：:「“]", before)
+            or any(before.count(left) > before.count(right)
+                   for left, right in (("“","”"),("「","」"),("『","』"),("‘","’")))
+            or before.count('"') % 2):
+        return None
+    question_fragment = re.split(r"[，。！；、,.!;\n]", after_permission, maxsplit=1)[0]
+    question_text = question_fragment.strip().strip('“”‘’「」"')
+    if re.search(r"可不可以|能不能", question_text) or re.search(_PROHIBITION, question_text):
+        return None
+    opening = re.search(_OPEN_REQUEST, before)
+    topics = [(key, match, topic_pattern, question)
+              for key, event_pattern, topic_pattern, question in _OPEN_TOPICS
+              for match in re.finditer(event_pattern, before)]
+    if not opening and not topics:
+        return None
+    if not opening or len(topics) != 1:
+        return {}
+    key, event_match, topic_pattern, question = topics[0]
+    clock_phrase = re.search(_MORNING_TOMORROW, before[:event_match.start()])
+    if (not clock_phrase or re.search(UNCERTAIN, before)
+            or not re.fullmatch(topic_pattern + r"吗?[？?]?", question_text)):
+        return {}
+    # Confirm the event and its day are in the same short clause. Later
+    # unrelated details do not become part of the stored follow-up evidence.
+    between = before[clock_phrase.end():event_match.start()]
+    if re.search(r"[。！？；\n]", between):
+        # A tightly scoped work-presentation form has a separate dated
+        # schedule ("明天上午十点做工作汇报") followed by its completion cue.
+        if key != "presentation" or not re.fullmatch(
+            r"[^，。！？；\n]{0,16}(?:做|进行)(?:工作)?汇报[。；]\s*(?:等)?我", between
+        ):
+            return {}
+    day = local_datetime.date() + timedelta(days=1)
+    checkpoint = datetime.combine(day, time(12)).isoformat(timespec="minutes")
+    ack = f"好。明天中午后你回来，我就问一句：{question}"
+    # Keep one exact evidence substring, without the user's unrelated clauses.
+    quote = (permission[0] + question_fragment).strip()
+    return {"key": key, "label": EVENT_NAMES.get(key, "汇报"), "date": day.isoformat(),
+            "not_before": checkpoint, "question": question, "ack": ack, "quote": quote}
+
+
+def save_followup_request(con, spec, user_id, now):
+    """Attach one explicit ask to the correlated event, without re-arming it."""
+    key, day = spec["key"], spec["date"]
+    if not con.in_transaction:
+        con.execute("BEGIN IMMEDIATE")
+    rows = con.execute("""SELECT event_id,status,not_before,followup_question,source_id
+        FROM events WHERE event_date=? AND (key=? OR key LIKE (? || ':%'))
+        ORDER BY event_id""", (day,key,key)).fetchall()
+    if len(rows) > 1:
+        return "ambiguous"
+    if rows:
+        event_id, status, not_before, question, source_id = rows[0]
+        if source_id > user_id or status != "pending":
+            return "closed"
+        if (not_before, question) == (spec["not_before"], spec["question"]):
+            return "saved"
+        con.execute("""UPDATE events SET version=version+1,not_before=?,followup_question=?,
+            source_id=?,quote=?,updated_at=? WHERE event_id=? AND status='pending' AND source_id<=?""",
+            (spec["not_before"],spec["question"],user_id,spec["quote"],now,event_id,user_id))
+        return "saved"
+    # A delayed retry must not recreate an event whose later assertion changed
+    # its date or resolved it.
+    latest = con.execute("""SELECT 1 FROM events WHERE (key=? OR key LIKE (? || ':%'))
+        AND source_id>? LIMIT 1""", (key,key,user_id)).fetchone()
+    if latest:
+        return "closed"
+    con.execute("""INSERT INTO events(key,label,event_date,status,source_id,quote,updated_at,
+        not_before,followup_question) VALUES (?,?,?,'pending',?,?,?,?,?)""",
+        (key,spec["label"],day,user_id,spec["quote"],now,spec["not_before"],spec["question"]))
+    return "saved"
+
+
 def migrate_events(con):
     """Upgrade old one-row-per-key data without committing the caller's transaction."""
     if not con.in_transaction:
@@ -179,12 +277,16 @@ def migrate_events(con):
         event_id INTEGER PRIMARY KEY, key TEXT NOT NULL, label TEXT NOT NULL,
         event_date TEXT NOT NULL, status TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
         source_id INTEGER NOT NULL REFERENCES messages(id), quote TEXT NOT NULL, updated_at TEXT NOT NULL,
-        followup_id INTEGER REFERENCES messages(id))""")
+        followup_id INTEGER REFERENCES messages(id), not_before TEXT, followup_question TEXT)""")
     if columns and "event_id" not in columns:
         con.execute("""INSERT INTO events(key,label,event_date,status,source_id,quote,updated_at,followup_id)
                        SELECT key,label,event_date,status,source_id,quote,updated_at,followup_id
                        FROM legacy_events ORDER BY key""")
         con.execute("DROP TABLE legacy_events")
+    if "event_id" in columns:
+        for name in ("not_before", "followup_question"):
+            if name not in columns:
+                con.execute(f"ALTER TABLE events ADD COLUMN {name} TEXT")
     con.execute("CREATE INDEX IF NOT EXISTS events_identity ON events(key, event_date)")
     con.execute("CREATE INDEX IF NOT EXISTS events_due ON events(status, event_date)")
 
@@ -257,7 +359,8 @@ def apply_event(con, kind, key, value, quote, user_id, now):
         if not target or target == event["event_date"]:
             return None
         con.execute("""UPDATE events SET event_date=?,status='pending',version=version+1,
-                       source_id=?,quote=?,updated_at=?,followup_id=NULL WHERE event_id=? AND source_id<=?""",
+                       source_id=?,quote=?,updated_at=?,followup_id=NULL,not_before=NULL,followup_question=NULL
+                       WHERE event_id=? AND source_id<=?""",
                     (target, user_id, quote, now, event["event_id"], user_id))
     elif kind == "resolve":
         con.execute("""UPDATE events SET status='resolved',version=version+1,source_id=?,quote=?,updated_at=?

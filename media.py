@@ -5,18 +5,17 @@ import io
 import json
 import re
 import wave
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
+from urllib.request import getproxies, proxy_bypass
 
+import aiohttp
 import httpx
-from websockets.asyncio.client import connect
-from websockets.exceptions import WebSocketException
 
 OPENAI_URL = "https://api.openai.com/v1"
 SERVICES = {
     "stt": ("语音识别", "gpt-transcribe"),
     "tts": ("语音合成", "gpt-realtime-2.1-mini"),
     "image": ("照片生成", "gpt-image-2.6-flare"),
-    "video": ("视频生成", ""),
 }
 VOICE_TONES = {
     "warm": "温柔自然，像跟熟人说话，不要主播腔。句间留一点停顿。",
@@ -47,44 +46,95 @@ def timeout_message(service):
     return f"{label}等待超时。这次没有自动重试，聊天仍可继续。"
 
 
+def _unquoted(text):
+    return re.sub(r'“[^”]*”|「[^」]*」|『[^』]*』|‘[^’]*’|"[^"]*"|\x60[^\x60]*\x60', " ", text)
+
+
+def text_only_turn(text):
+    """Honor a direct reply-format choice without changing the saved mode."""
+    in_example = False
+    for fragment in re.split(r"([。！？；.!?;\n]+)|[，、,：:]+", _unquoted(text)):
+        if fragment is None:
+            continue
+        clause = fragment.strip()
+        if re.fullmatch(r"[。！？；.!?;\n]+", fragment):
+            in_example = False
+            continue
+        if re.match(r"^(?:例如|比如|假设|假如|如果|举个例|举例|(?:我|他|她|他们|她们|你)(?:刚才|之前|曾经)?(?:说过|说|提到))", clause):
+            in_example = True
+        if in_example:
+            continue
+        match = re.fullmatch(
+            r"(?:(?:这(?:一)?次|这(?:一)?轮|这一句|现在|请|麻烦你|你|今天|先)\s*)*"
+            r"(?:"
+            r"(?:(?:就|只|仅)\s*(?:用|发|回(?:我)?|回复(?:我)?|打)?|用|发|回(?:我)?|回复(?:我)?|打)\s*"
+            r"(?:一小句|一句|一条|几句|简短的)?\s*(?:纯)?(?:文字|文本)"
+            r"(?:回复|回答|回我)?(?:就好|即可|就行)?"
+            r"|(?:不要|不用|别|不必|不需要)\s*(?:再|先)?\s*(?:发|用|回|回复|发送|合成|播放)?\s*"
+            r"(?:语音(?:消息|回复)?|音频)"
+            r")[吧啊哈呀哦啦呢好吗]*",
+            clause,
+        )
+        if match:
+            return True
+    return False
+
+
 def intent(text):
     """Only direct requests may bypass the separate proactive-image opt-in."""
     photo=video=negated=False
     nouns=r"照片|自拍|张图|图片|视频|短片"
-    for fragment in re.split(r"[，。！？；、,.!?;\n]+",text):
+    for fragment in re.split(r"[，。！？；、,.!?;\n]+",_unquoted(text)):
         clause=fragment.strip(" \t：:～~")
-        if not clause or not re.search(nouns,clause) or re.search(r"假设|假如|如果|比如|引用|举例",clause):
+        implicit_window = bool(re.search(
+            r"(?:发|拍)(?:一)?张\s*(?:你想象中的)?窗边\s*给我(?:看看|瞧瞧)[吗吧好吗呀]*$",
+            clause,
+        ))
+        image_ref = re.search(nouns,clause) or implicit_window
+        if not clause or re.search(r"假设|假如|如果|比如|引用|举例",clause):
             continue
-        if re.search(r"(?:发完|发出|发好了|发了|拍完|拍好了|拍了|传完|传好了|传了|什么时候发|怎么还没发)|(?:了(?:吗|没|没有)|没(?:有)?发)[呀啊呢吗]*$",clause):
+        if (image_ref or re.search(r"发图|拍图",clause)) and re.match(
+            r"^(?:(?:你|请你)\s*)?(?:别|不要|不用|不想)(?:再)?\s*(?:给我\s*)?(?:发|拍|看)",clause
+        ):
             negated=True
             continue
-        if re.match(r"^(?:(?:你|请你)\s*)?(?:别|不要|不用|不想)(?:再)?\s*(?:给我\s*)?(?:发|拍|看)",clause):
+        if not image_ref:
+            continue
+        if (re.search(r"(?:发完|发出|发好了|发了|拍完|拍好了|拍了|传完|传好了|传了|什么时候发|怎么还没发)|(?:了(?:吗|没|没有)|没(?:有)?发)[呀啊呢吗]*$",clause)
+            or re.match(r"^(?:我|我们)(?:来|先|再|想)?(?:给你)?(?:发|拍|传|分享)",clause)):
             negated=True
             continue
         action=r"(?:发(?:给我)?|拍(?:给我)?|给我(?:发|拍|看)|分享|传)(?!了|过)"
-        command=bool(re.match(r"(?:(?:阿晚|晚晚)\s*)?(?:(?:你|请你?|麻烦你?|能不能|可不可以|可以|能|帮我|给我|来|想请你|我想请你)\s*){0,5}"+action,clause))
+        command=bool(re.match(r"(?:(?:阿晚|晚晚)\s*)?(?:(?:你|请你?|麻烦你?|能不能|可不可以|可以|能|帮我|给我|来|再|想请你|我想请你)\s*){0,5}"+action,clause))
         desire=bool(re.match(r"^(?:(?:我)?(?:想|要)(?:看看?|瞧瞧)|(?:让|给)我看看?|(?:可以|能不能)让我看)",clause))
         noun_first=bool(re.match(r"^(?:照片|自拍|图片|视频|短片)(?:请)?(?:发|传)给?我(?:看看?|瞧瞧|一下|吧|好吗)?$",clause))
         if not (command or desire or noun_first):
             continue
         if re.search(r"视频|短片",clause):
             video=True
-        elif re.search(r"照片|自拍|张图|图片",clause):
+        elif implicit_window or re.search(r"照片|自拍|张图|图片",clause):
             photo=True
     return {"video":video,"photo":photo and not video,"negated":negated and not (photo or video)}
 
 
 def tone_for(text):
-    if re.search(r"难受|累|难过|心烦|失眠|委屈|紧张|不想听建议", text):
-        return "comfort"
-    if re.search(r"开心|太好了|通过了|庆祝|恭喜|好消息", text):
+    text = _unquoted(text)
+    negated = r"(?:没有|没|不|未)\s*(?:能|成功|觉得|那么|怎么)?\s*(?:开心|通过(?:了)?|太好(?:了)?|庆祝|好消息)"
+    current = re.sub(negated, " ", text)
+    if re.search(r"通过了|终于通过|过关了", current):
         return "bright"
-    if re.search(r"晚安|要睡|睡了|夜里", text):
+    if re.search(negated, text) or re.search(r"难受|累|难过|心烦|失眠|委屈|紧张|不想听建议", current):
+        return "comfort"
+    if re.search(r"开心|太好了|庆祝|恭喜|好消息", current):
+        return "bright"
+    if re.search(r"晚安|要睡|睡了|夜里", current):
         return "quiet"
     return "warm"
 
 
 def scene_hint(text):
+    if re.search(r"雨窗|雨天的窗边|雨中的窗边|窗边|窗台", _unquoted(text)) and intent(text)["photo"]:
+        return "home"
     if re.search(r"你长什么|自拍|你的照片|发张照片看看", text):
         return "selfie"
     if re.search(r"吃|晚饭|午饭|做饭|下厨|面条|牛肉饭", text) or any(word in text for word in MEAL_DETAILS):
@@ -97,14 +147,28 @@ def scene_hint(text):
 MEAL_DETAILS=("番茄牛肉饭","番茄鸡蛋面","葱油拌面","鸡蛋面","三明治","煎饺","炒饭","牛肉面",
               "番茄炒蛋","麻婆豆腐","粥","寿司","披萨","沙拉","咖喱","饺子","米饭")
 WALK_DETAILS=("雨后的路面","雨后","江边","河边","公园","街角","小巷","咖啡店","落叶","路灯")
+HOME_DETAILS = {
+    "窗边": "素净的寻常家里，一扇窗和安静的窗台",
+    "雨窗": "素净的寻常家里，玻璃上有雨滴的窗边",
+    "窗边饺子": "素净的寻常家里，窗边放着一小盘饺子",
+    "雨窗饺子": "素净的寻常家里，玻璃上有雨滴的窗边放着一小盘饺子",
+}
 
 def photo_detail(scene, source, reply):
+    if scene == "home":
+        # Only map source words to complete, allowlisted compositions.
+        source = _unquoted(source)
+        rainy = re.search(r"雨窗|雨(?:天|中|里)的?窗[边台]|窗[边台][^，。！？]{0,12}(?:雨滴|下雨)", source)
+        if rainy or "窗边" in source or "窗台" in source:
+            return ("雨窗" if rainy else "窗边") + ("饺子" if "饺子" in source else "")
     vocabulary = MEAL_DETAILS if scene=="meal" else WALK_DETAILS if scene=="walk" else ()
     return next((word for text in (source,reply) for word in vocabulary if word in text), "")
 
 
 def image_prompt(scene, detail=""):
-    if detail and detail in (MEAL_DETAILS if scene=="meal" else WALK_DETAILS if scene=="walk" else ()):
+    if scene == "home" and detail in HOME_DETAILS:
+        scene_text = HOME_DETAILS[detail] + "，画面不出现人物或人像"
+    elif detail and detail in (MEAL_DETAILS if scene=="meal" else WALK_DETAILS if scene=="walk" else ()):
         scene_text = ("普通陶瓷盘碗里、刚做好的"+detail+"，旁边有家用餐具"
                       if scene=="meal" else "画面明显切合"+detail+"，随手拍到的街景")
     else:
@@ -128,33 +192,80 @@ async def audio_reply(setup, key, text, tone):
     url = setup["base_url"].replace("https://","wss://",1) + "/realtime?" + urlencode({"model":setup["model"]})
     instructions = ("用普通话念输入文本，不改写、不加开场词。语气像虚构角色阿晚。"
                     + VOICE_TONES.get(tone,VOICE_TONES["warm"]))
-    async def send(ws, payload):
-        await ws.send(json.dumps(payload,ensure_ascii=False))
+    async def block_redirect(session, context, params):
+        params.response.close()
+        raise MediaFailure("语音合成连接被重定向，已停止。")
+
+    async def one_handshake(request, handler):
+        # aiohttp retries certain idempotent GET transport failures by default.
+        # Convert them before its retry loop sees them.
+        try:
+            return await handler(request)
+        except (aiohttp.ClientOSError,aiohttp.ServerDisconnectedError):
+            raise MediaFailure("语音合成无法建立连接，请检查网络或代理。") from None
+
+    trace = aiohttp.TraceConfig()
+    trace.on_request_redirect.append(block_redirect)
+    connected = False
     try:
-        async with asyncio.timeout(45):
-            async with connect(url,additional_headers={"Authorization":f"Bearer {key}"},
-                               open_timeout=12,max_size=4*1024*1024) as ws:
-                await send(ws,{"type":"session.update","session":{"type":"realtime",
-                    "instructions":instructions,"output_modalities":["audio"],
-                    "audio":{"output":{"voice":setup.get("voice","marin"),"format":{"type":"audio/pcm","rate":24000}}}}})
-                await send(ws,{"type":"conversation.item.create","item":{"type":"message","role":"user",
-                    "content":[{"type":"input_text","text":text}]}})
-                await send(ws,{"type":"response.create","response":{"output_modalities":["audio"]}})
-                audio = bytearray()
-                async for payload in ws:
-                    event = json.loads(payload)
-                    if event.get("type") == "error":
-                        raise MediaFailure("语音合成被服务拒绝，请检查模型、音色和接口权限。")
-                    if event.get("type") == "response.output_audio.delta":
-                        audio.extend(base64.b64decode(event["delta"],validate=True))
-                        if len(audio) > MAX_ASSET-44:
-                            raise MediaFailure("语音结果过大。")
-                    if event.get("type") == "response.done":
-                        if event["response"].get("status") == "completed" and audio and not len(audio)%2:
-                            return "audio/wav",pcm_wav(audio)
-                        break
-    except (OSError,TimeoutError,WebSocketException,ValueError,KeyError,ImportError):
-        raise MediaFailure("语音合成暂时不可用，请检查接口或网络。") from None
+        dest = urlsplit(url)
+        proxy = None
+        if not proxy_bypass(f"{dest.hostname}:{dest.port or 443}"):
+            proxies = getproxies()
+            scheme = next((s for s in ("wss", "socks", "https") if proxies.get(s)), None)
+            if scheme:
+                proxy = proxies[scheme]
+                proxy_url = urlsplit(proxy)
+                if scheme == "socks" or proxy_url.scheme not in ("http", "https") or not proxy_url.hostname:
+                    raise MediaFailure("语音合成无法使用当前网络代理，未发送语音请求。")
+        # Select the proxy explicitly: aiohttp otherwise looks for WSS_PROXY
+        # only, while the previous client also honored HTTPS_PROXY for wss.
+        async with asyncio.timeout(55):
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20,connect=20,sock_connect=20),
+                                             trace_configs=[trace], middlewares=(one_handshake,),
+                                             trust_env=False) as client:
+                async with client.ws_connect(url, headers={"Authorization":f"Bearer {key}"},
+                                             proxy=proxy, timeout=aiohttp.ClientWSTimeout(ws_close=3),
+                                             max_msg_size=4*1024*1024) as ws:
+                    connected = True
+                    await ws.send_json({"type":"session.update","session":{"type":"realtime",
+                        "instructions":instructions,"output_modalities":["audio"],
+                        "audio":{"output":{"voice":setup.get("voice","marin"),"format":{"type":"audio/pcm","rate":24000}}}}})
+                    await ws.send_json({"type":"conversation.item.create","item":{"type":"message","role":"user",
+                        "content":[{"type":"input_text","text":text}]}})
+                    await ws.send_json({"type":"response.create","response":{"output_modalities":["audio"]}})
+                    audio = bytearray()
+                    async for message in ws:
+                        if message.type == aiohttp.WSMsgType.ERROR:
+                            raise MediaFailure("语音合成连接中断，未收到完整语音。")
+                        if message.type != aiohttp.WSMsgType.TEXT:
+                            raise MediaFailure("语音合成没有返回有效结果。")
+                        event = json.loads(message.data)
+                        if event.get("type") == "error":
+                            raise MediaFailure("语音合成被服务拒绝，请检查模型、音色和接口权限。")
+                        if event.get("type") == "response.output_audio.delta":
+                            audio.extend(base64.b64decode(event["delta"],validate=True))
+                            if len(audio) > MAX_ASSET-44:
+                                raise MediaFailure("语音结果过大。")
+                        if event.get("type") == "response.done":
+                            if event["response"].get("status") == "completed" and audio and not len(audio)%2:
+                                return "audio/wav",pcm_wav(audio)
+                            if event["response"].get("status") == "failed":
+                                raise MediaFailure("语音合成被服务拒绝，请检查模型、音色和接口权限。")
+                            break
+    except aiohttp.WSServerHandshakeError as exc:
+        if exc.status in (400,401,403,404,429):
+            raise MediaFailure("语音合成被服务拒绝，请检查 Key、模型权限或额度。") from None
+        raise MediaFailure("语音合成无法建立连接，请检查网络或代理。") from None
+    except TimeoutError:
+        if connected:
+            raise MediaFailure(timeout_message("tts")) from None
+        raise MediaFailure("语音合成连接超时，请检查网络或代理。") from None
+    except (OSError,aiohttp.ClientError):
+        message = "语音合成连接中断，未收到完整语音。" if connected else "语音合成无法建立连接，请检查网络或代理。"
+        raise MediaFailure(message) from None
+    except (ValueError,KeyError,TypeError,AttributeError):
+        raise MediaFailure("语音合成没有返回有效结果。") from None
     raise MediaFailure("未收到完整语音。")
 
 

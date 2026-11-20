@@ -57,7 +57,7 @@ function renderMessages({stick=false, preserve=false, arrived=false}={}){
   const oldBounds=content.getBoundingClientRect();
   const oldTop=content.scrollTop;
   const focused=document.activeElement;
-  let anchor=null;
+  let anchor=null, focusReplacement=null;
   if(!atBottom&&!stick){
     for(const row of content.querySelectorAll("[data-message-key]")){
       const rect=row.getBoundingClientRect();
@@ -96,8 +96,18 @@ function renderMessages({stick=false, preserve=false, arrived=false}={}){
       if(row.role!=="user"){
         const av=el("span","bubble-avatar","晚");av.setAttribute("aria-hidden","true");line.append(av);
       }
-      const block=window.mediaUI?.display(row)||el("div","message-content");line.append(block);
+      const transcript=entry?.block.querySelector(".transcript");
+      const block=window.mediaUI?.display(row,{transcriptOpen:!!transcript?.open})||el("div","message-content");line.append(block);
       if(!window.mediaUI)block.append(el("div","bubble",row.text));
+      if(transcript&&focused&&transcript.querySelector("summary")===focused){
+        focusReplacement=block.querySelector("summary")||block.querySelector(".bubble");
+        if(focusReplacement&&focusReplacement.tagName!=="SUMMARY")focusReplacement.tabIndex=-1;
+      }
+      if(focused?.dataset.removeAttachmentId&&entry?.block.contains(focused)){
+        const wasRemoved=[...block.querySelectorAll("[data-removed-attachment-id]")]
+          .find(marker=>marker.dataset.removedAttachmentId===focused.dataset.removeAttachmentId);
+        if(wasRemoved)focusReplacement=wasRemoved;
+      }
       entry={line,block,signature};renderedRows.set(key,entry);
     }
     if(row.role==="user"){
@@ -137,7 +147,8 @@ function renderMessages({stick=false, preserve=false, arrived=false}={}){
     if(arrived)newMessages=true;
   }
   $("new-messages").hidden=!newMessages;
-  if(focused?.isConnected&&focused!==document.body)focused.focus({preventScroll:true});
+  if(focusReplacement)focusReplacement.focus({preventScroll:true});
+  else if(focused?.isConnected&&focused!==document.body)focused.focus({preventScroll:true});
   else if(focused?.id==="older-messages")($("older-messages")||content).focus({preventScroll:true});
   window.mediaUI?.poll();
 }
@@ -152,7 +163,7 @@ function mergeMessages(messages, options={}){
     const priorAssets=new Map((old?.attachments||[]).map(a=>[a.id,a]));
     for(const next of row.attachments||[]){
       const prior=priorAssets.get(next.id);
-      if(!prior||prior.state==="pending"||next.state!=="pending")priorAssets.set(next.id,next);
+      if(prior?.state!=="removed"&&(!prior||prior.state==="pending"||next.state!=="pending"))priorAssets.set(next.id,next);
     }
     const entry={...old,...row,attachments:[...priorAssets.values()]};
     if(old?.delivery_state==="archived"||archivedRequests.has(row.request_id))entry.delivery_state="archived";

@@ -15,6 +15,8 @@ function el(tag,cls,text){
   const node=document.createElement(tag);if(cls)node.className=cls;if(text)node.textContent=text;return node;
 }
 function renderMessages(messages){
+  const atBottom=$("messages").scrollHeight-$("messages").scrollTop-$("messages").clientHeight<120;
+  const previousTop=$("messages").scrollTop;
   shown=messages;
   const content=$("messages");content.replaceChildren();
   if(!messages.length){
@@ -42,9 +44,10 @@ function renderMessages(messages){
     if(row.role==="followup")content.append(el("div","day-note proactive","✦ 阿晚想起了这件事"));
     const line=el("div","row "+row.role);
     if(row.role!=="user"){const av=el("span","bubble-avatar","晚");av.setAttribute("aria-hidden","true");line.append(av);}
-    line.append(el("div","bubble",row.text));content.append(line);
+    line.append(window.mediaUI?.display(row)||el("div","bubble",row.text));content.append(line);
   }
-  content.scrollTop=content.scrollHeight;
+  content.scrollTop=atBottom?content.scrollHeight:previousTop;
+  window.mediaUI?.poll();
 }
 function rememberedTitle(key){
   return {residence:"现居地",pet_name:"宠物名字",name:"称呼"}[key]||(key.startsWith("food:")?"饮食偏好":key.replace(/^preference:/,""));
@@ -82,6 +85,7 @@ async function openChat(demo_date=null){
   renderMessages(result.messages);retryFollowup=false;return result;
 }
 async function navigate(next){
+  if(next!=="chat")window.mediaUI?.leaveChat();
   tab=next;notice();
   for(const button of document.querySelectorAll("[data-tab]")){
     if(button.dataset.tab===next)button.setAttribute("aria-current","page");
@@ -90,7 +94,7 @@ async function navigate(next){
   for(const name of ["chat","memory","settings"])$(name).hidden=name!==next;
   try{
     if(next==="memory")await loadMemory();
-    if(next==="settings")fill(await api("/settings"));
+    if(next==="settings"){fill(await api("/settings"));await window.mediaUI?.load();}
     if(next==="chat"&&retryFollowup)await openChat();
   }catch(e){notice(e.message);}
 }
@@ -99,10 +103,16 @@ function syncRetry(){ $("retry").hidden=!pending;$("retry").disabled=busy; }
 async function send(){
   if(!pending||busy)return;
   busy=true;$("send").disabled=true;$("send").textContent="等回复…";syncRetry();notice();
-  try{const r=await api("/chat/messages","POST",pending);renderMessages(r.messages);pending=null;}
+  try{
+    const r=pending.audio?await window.mediaUI.submitAudio(pending):await api("/chat/messages","POST",pending);
+    renderMessages(r.messages);pending=null;window.mediaUI?.clearDraft();
+  }
   catch(e){
-    notice(e.message+" 可以重试刚才那条消息。");
-    try{renderMessages((await api("/chat")).messages);}catch{}
+    let stateKnown=false;
+    try{renderMessages((await api("/chat")).messages);stateKnown=true;}catch{}
+    if(pending?.audio&&stateKnown&&!shown.some(m=>m.request_id===pending.request_id)){
+      pending=null;notice(e.message+" 可重试录音，也可直接打字。");
+    }else notice(e.message+" 可以重试刚才那条消息。");
   }finally{busy=false;$("send").disabled=false;$("send").textContent="发送 ↑";syncRetry();}
 }
 $("composer").onsubmit=e=>{
@@ -135,6 +145,7 @@ $("clock").onsubmit=async e=>{
 (async()=>{
  try{
    fill(await api("/settings"));
+   window.mediaUI?.load(false).catch(()=>{});
    renderMessages((await api("/chat")).messages);
    const last=shown.at(-1);
    if(last?.role==="user"&&last.request_id){pending={text:last.text,request_id:last.request_id};syncRetry();}

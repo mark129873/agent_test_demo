@@ -1,4 +1,4 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>晚灯 · 阿晚</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script></head>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>晚灯 · 阿晚</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script><script src="/static/media.js" defer></script></head>
 <body><main class="shell">
   <header><div class="avatar" aria-hidden="true">晚</div><div class="identity"><h1>阿晚</h1><p><span class="spark">✦</span> 晚灯 · 私人聊天</p></div><span class="badge" id="mode">连接中</span></header>
   <nav aria-label="页面"><button data-tab="chat" aria-current="page">聊天</button><button data-tab="memory">记忆</button><button data-tab="settings">设置</button></nav>
@@ -6,7 +6,9 @@
   <section id="chat" class="page">
     <div id="messages" class="messages" aria-live="polite" aria-label="聊天记录"></div>
     <button type="button" id="retry" class="secondary" hidden>重试回复</button>
-    <form id="composer"><label class="sr" for="message">消息</label><textarea id="message" rows="2" maxlength="2400" placeholder="跟阿晚说点什么…" required></textarea><button id="send" type="submit">发送 <span aria-hidden="true">↑</span></button></form>
+    <div id="rec-status" class="rec-status" role="status" hidden></div>
+    <div id="rec-preview" class="rec-preview" hidden><audio id="draft-audio" controls aria-label="录音预听"></audio><button type="button" id="discard-audio" class="secondary">重录</button><button type="button" id="send-audio">发送语音</button></div>
+    <form id="composer"><button type="button" id="mic" class="secondary" aria-label="录音" title="录音">🎙</button><label class="sr" for="message">消息</label><textarea id="message" rows="2" maxlength="2400" placeholder="跟阿晚说点什么…" required></textarea><button id="send" type="submit">发送 <span aria-hidden="true">↑</span></button></form>
   </section>
   <section id="memory" class="page scroll" hidden><h2>她记得的事</h2><p class="muted">只显示当前记忆。展开一条，可以看它来自哪句话。</p><div id="memory-list"></div></section>
   <section id="settings" class="page scroll" hidden><h2>模型设置</h2><p class="muted">模拟模式不联网。切到 OpenAI 后，当前对话和选中的记忆会发往 OpenAI，调用可能产生费用。</p>
@@ -20,6 +22,15 @@
       <div class="actions"><button type="submit">保存设置</button><button id="clear-key" type="button" class="secondary">清除本次 Key</button></div>
     </form>
     <details id="demo"><summary>演示工具：模拟回到聊天页</summary><p class="muted">只在模拟模式使用。选面试后的日期来模拟重开；不会改系统时钟或事件日期，但回访消息会写入当前聊天。</p><form id="clock"><label>模拟打开日期<input type="date" id="demo-date" required></label><button>在该日期打开聊天</button></form></details>
-  </section>
+  <section class="media-settings" aria-labelledby="media-title">
+      <h2 id="media-title">语音与媒体</h2>
+      <p class="muted">开启服务后，在 OpenAI 模式下按需调用，可能产生费用。不影响文字消息。</p>
+      <form id="media-config">
+        <label>接收回复<select id="reply-mode"><option value="text">只收文字</option><option value="voice">只收语音</option><option value="both">文字与语音</option></select></label>
+        <label class="check"><input type="checkbox" id="proactive-images">允许阿晚偶尔主动分享照片</label>
+        <div id="media-services"></div><button type="submit">保存语音与媒体设置</button>
+      </form>
+    </section>
+    </section>
   
 </main></body></html>

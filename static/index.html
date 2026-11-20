@@ -1,0 +1,25 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>晚灯 · 阿晚</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script></head>
+<body><main class="shell">
+  <header><div class="avatar" aria-hidden="true">晚</div><div class="identity"><h1>阿晚</h1><p><span class="spark">✦</span> 晚灯 · 私人聊天</p></div><span class="badge" id="mode">连接中</span></header>
+  <nav aria-label="页面"><button data-tab="chat" aria-current="page">聊天</button><button data-tab="memory">记忆</button><button data-tab="settings">设置</button></nav>
+  <div class="notice" id="notice" role="status" hidden></div>
+  <section id="chat" class="page">
+    <div id="messages" class="messages" aria-live="polite" aria-label="聊天记录"></div>
+    <button type="button" id="retry" class="secondary" hidden>重试回复</button>
+    <form id="composer"><label class="sr" for="message">消息</label><textarea id="message" rows="2" maxlength="2400" placeholder="跟阿晚说点什么…" required></textarea><button id="send" type="submit">发送 <span aria-hidden="true">↑</span></button></form>
+  </section>
+  <section id="memory" class="page scroll" hidden><h2>她记得的事</h2><p class="muted">只显示当前记忆。展开一条，可以看它来自哪句话。</p><div id="memory-list"></div></section>
+  <section id="settings" class="page scroll" hidden><h2>模型设置</h2><p class="muted">模拟模式不联网。切到 OpenAI 后，当前对话和选中的记忆会发往 OpenAI，调用可能产生费用。</p>
+    <form id="config">
+      <label>模式<select id="provider"><option value="mock">模拟（离线）</option><option value="openai">OpenAI</option></select></label>
+      <label>接口地址<input id="base" type="url" required></label>
+      <label>模型名称<input id="model" required></label>
+      <label>本地时区<input id="timezone" placeholder="Asia/Shanghai" required></label>
+      <label>API Key<input id="key" type="password" autocomplete="off" placeholder="留空则保留本次已配置的 Key"></label>
+      <p class="muted" id="key-info">Key 不回显，不写入磁盘；也可用环境变量 OPENAI_API_KEY。</p>
+      <div class="actions"><button type="submit">保存设置</button><button id="clear-key" type="button" class="secondary">清除本次 Key</button></div>
+    </form>
+    <details id="demo"><summary>演示工具：模拟回到聊天页</summary><p class="muted">只在模拟模式使用。选面试后的日期来模拟重开；不会改系统时钟或事件日期，但回访消息会写入当前聊天。</p><form id="clock"><label>模拟打开日期<input type="date" id="demo-date" required></label><button>在该日期打开聊天</button></form></details>
+  </section>
+  
+</main></body></html>

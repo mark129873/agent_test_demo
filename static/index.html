@@ -1,36 +1,79 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>晚灯 · 阿晚</title><link rel="stylesheet" href="/static/style.css"><script src="/static/app.js" defer></script><script src="/static/media.js" defer></script></head>
-<body><main class="shell">
-  <header><div class="avatar" aria-hidden="true">晚</div><div class="identity"><h1>阿晚</h1><p><span class="spark">✦</span> 晚灯 · 私人聊天</p></div><span class="badge" id="mode">连接中</span></header>
-  <nav aria-label="页面"><button data-tab="chat" aria-current="page">聊天</button><button data-tab="memory">记忆</button><button data-tab="settings">设置</button></nav>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>晚灯 · 阿晚</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+  <script src="/static/media.js" defer></script>
+</head>
+<body>
+<main class="shell">
+  <header>
+    <button class="companion" type="button" data-tab="chat" aria-current="page" aria-label="回到与阿晚的聊天">
+      <span class="avatar" aria-hidden="true">晚</span>
+      <span class="identity"><span class="companion-name">阿晚</span><span class="companion-subtitle"><span aria-hidden="true">✦</span> 晚灯 · 私人聊天</span></span>
+    </button>
+    <nav aria-label="聊天工具">
+      <button type="button" data-tab="memory">记忆</button>
+      <button type="button" data-tab="settings">设置</button>
+    </nav>
+  </header>
   <div class="notice" id="notice" role="status" hidden></div>
-  <section id="chat" class="page">
-    <div id="messages" class="messages" aria-live="polite" aria-label="聊天记录"></div>
-    <button type="button" id="retry" class="secondary" hidden>重试回复</button>
+  <section id="chat" class="page" aria-label="与阿晚聊天">
+    <div id="messages" class="messages" role="region" aria-label="聊天记录" tabindex="0"></div>
+    <span class="sr" id="chat-update" role="status"></span>
+    <div class="new-messages" id="new-messages" hidden><button type="button" class="secondary" id="to-latest">回到最新消息 ↓</button></div>
+    <div id="chat-setup" class="chat-setup" hidden><span id="chat-setup-text"></span><button type="button" id="go-settings" class="secondary">前往设置</button></div>
     <div id="rec-status" class="rec-status" role="status" hidden></div>
-    <div id="rec-preview" class="rec-preview" hidden><audio id="draft-audio" controls aria-label="录音预听"></audio><button type="button" id="discard-audio" class="secondary">重录</button><button type="button" id="send-audio">发送语音</button></div>
-    <form id="composer"><button type="button" id="mic" class="secondary" aria-label="录音" title="录音">🎙</button><label class="sr" for="message">消息</label><textarea id="message" rows="2" maxlength="2400" placeholder="跟阿晚说点什么…" required></textarea><button id="send" type="submit">发送 <span aria-hidden="true">↑</span></button></form>
-  </section>
-  <section id="memory" class="page scroll" hidden><h2>她记得的事</h2><p class="muted">只显示当前记忆。展开一条，可以看它来自哪句话。</p><div id="memory-list"></div></section>
-  <section id="settings" class="page scroll" hidden><h2>模型设置</h2><p class="muted">模拟模式不联网。切到 OpenAI 后，当前对话和选中的记忆会发往 OpenAI，调用可能产生费用。</p>
-    <form id="config">
-      <label>模式<select id="provider"><option value="mock">模拟（离线）</option><option value="openai">OpenAI</option></select></label>
-      <label>接口地址<input id="base" type="url" required></label>
-      <label>模型名称<input id="model" required></label>
-      <label>本地时区<input id="timezone" placeholder="Asia/Shanghai" required></label>
-      <label>API Key<input id="key" type="password" autocomplete="off" placeholder="输入 OpenAI API Key" aria-describedby="key-info"></label>
-      <p class="muted" id="key-info">Key 不回显，不写入磁盘；也可用环境变量 OPENAI_API_KEY。</p>
-      <div class="actions"><button type="submit">保存设置</button><button id="clear-key" type="button" class="secondary">清除本次 Key</button></div>
+    <div id="rec-preview" class="rec-preview" hidden>
+      <audio id="draft-audio" controls aria-label="录音预听"></audio>
+      <button type="button" id="discard-audio" class="secondary">丢弃录音</button>
+      <button type="button" id="send-audio">发送语音</button>
+    </div>
+    <form id="composer">
+      <button type="button" id="mic" class="secondary" aria-label="录音" title="录音">🎙</button>
+      <label class="sr" for="message">消息</label>
+      <textarea id="message" rows="2" maxlength="2400" placeholder="跟阿晚说点什么…" required></textarea>
+      <button id="send" type="submit">发送 ↑</button>
     </form>
-    <details id="demo"><summary>演示工具：模拟回到聊天页</summary><p class="muted">只在模拟模式使用。选面试后的日期来模拟重开；不会改系统时钟或事件日期，但回访消息会写入当前聊天。</p><form id="clock"><label>模拟打开日期<input type="date" id="demo-date" required></label><button>在该日期打开聊天</button></form></details>
-  <section class="media-settings" aria-labelledby="media-title">
-      <h2 id="media-title">语音与媒体</h2>
-      <p class="muted">开启服务后，在 OpenAI 模式下按需调用，可能产生费用。不影响文字消息。</p>
+  </section>
+  <section id="memory" class="page scroll" hidden aria-labelledby="memory-title">
+    <div class="section-head"><button type="button" class="back-link secondary">← 回到聊天</button><h2 id="memory-title" tabindex="-1">她记得的事</h2></div>
+    <p class="muted">展开一条，可以查看出处、更正或忘记记忆，也可以停用不想再聊或被问起的事件。</p>
+    <div id="memory-list"></div>
+  </section>
+  <section id="settings" class="page scroll" hidden aria-labelledby="settings-title">
+    <div class="section-head"><button type="button" class="back-link secondary">← 回到聊天</button><h2 id="settings-title" tabindex="-1">设置</h2></div>
+    <h3>文字聊天</h3>
+    <form id="config">
+      <label>聊天方式<select id="provider"><option value="mock">离线模拟</option><option value="openai">接入模型（OpenAI）</option></select></label>
+      <p class="muted">离线模拟不联网。接入模型后，当前对话和相关记忆会发送给配置的服务，可能产生费用。</p>
+      <label>API Key<input id="key" type="password" autocomplete="off" placeholder="输入 OpenAI API Key" aria-describedby="key-info"></label>
+      <p class="muted" id="key-info">Key 不回显。填写后加密保存在本机。</p>
+      <div class="actions"><button type="submit">保存聊天设置</button><button id="clear-key" type="button" class="secondary">清除本机保存的 Key</button></div>
+      <details class="settings-detail"><summary>连接与时区</summary>
+        <label>接口地址<input id="base" type="url" required></label>
+        <label>模型名称<input id="model" required></label>
+        <label>本地时区<input id="timezone" placeholder="Asia/Shanghai" required></label>
+        <label class="check"><input type="checkbox" id="online-summary" aria-describedby="summary-info">允许生成长期对话摘要</label>
+        <p class="muted" id="summary-info">默认关闭。开启后，接入的模型可能收到更早的聊天以生成长期摘要，产生额外调用与费用。关闭后，在线回复不会使用旧摘要。</p>
+      </details>
+    </form>
+    <section class="media-settings" aria-labelledby="media-title">
+      <h3 id="media-title">语音与媒体</h3>
+      <p class="muted">接入模型并启用对应服务后，阿晚可以按需发送语音或照片，调用可能产生费用。</p>
       <form id="media-config">
         <label>接收回复<select id="reply-mode"><option value="text">只收文字</option><option value="voice">只收语音</option><option value="both">文字与语音</option></select></label>
         <label class="check"><input type="checkbox" id="proactive-images">允许阿晚偶尔主动分享照片</label>
         <div id="media-services"></div><button type="submit">保存语音与媒体设置</button>
       </form>
     </section>
-    </section>
-  
-</main></body></html>
+    <details id="demo" class="settings-detail" hidden><summary>日期调试</summary><p class="muted">仅用于离线模拟。不会改变系统日期，但产生的回访会写入聊天。</p><form id="clock"><label>模拟打开日期<input type="date" id="demo-date" required></label><button>在该日期检查回访</button></form></details>
+    <details class="settings-detail"><summary>连接诊断</summary><p class="muted" id="diagnostics">目前没有连接错误。</p></details>
+  </section>
+</main>
+</body>
+</html>

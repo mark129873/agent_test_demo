@@ -1,9 +1,8 @@
 "use strict";
 window.mediaUI=(()=>{
-  let options, timer=null, recorder=null, recordTimer=null, draft=null, draftURL=null;
+  let options, timer=null, recorder=null, recordTimer=null, draft=null, draftURL=null, draftRequest=null, attemptedDraft=false;
   const titles={stt:"语音识别",tts:"语音合成",image:"照片生成",video:"视频生成（暂未接入）"};
   const clips=new Map();
-  const rid=()=>globalThis.crypto?.randomUUID?.()||Date.now()+"-"+Math.random().toString(36).slice(2);
   function display(row){
     const block=el("div","message-content"), assets=row.attachments||[];
     const voice=assets.find(a=>a.kind==="tts"&&a.presentation==="voice");
@@ -37,12 +36,16 @@ window.mediaUI=(()=>{
   function poll(){
     if(timer||!shown.some(m=>(m.attachments||[]).some(a=>a.state==="pending")))return;
     timer=setTimeout(async()=>{
-      timer=null;
       try{
         const {messages}=await api("/chat");
-        if(!busy&&JSON.stringify(messages)!==JSON.stringify(shown))renderMessages(messages);
+        mergeMessages(messages);
+        const oldestPending=shown.find(row=>row.id&&!messages.some(item=>item.id===row.id)&&(row.attachments||[]).some(asset=>asset.state==="pending"));
+        if(oldestPending){
+          const older=await api("/chat?before="+encodeURIComponent(oldestPending.id+1));
+          mergeMessages(older.messages,{preserve:true});
+        }
       }catch{}
-      poll();
+      finally{timer=null;poll();}
     },950);
   }
   function formField(d,label,kind,name,type,value,hidden=false){
@@ -67,12 +70,22 @@ window.mediaUI=(()=>{
       formField(d,"模型名称",kind,"model","text",m.model);
       const key=formField(d,"API Key",kind,"key","password","");
       key.autocomplete="off";key.placeholder=m.override_key_set?"••••••••":"输入此服务的 Key";
-      formField(d,"清除此服务单独保存的 Key",kind,"clear","checkbox",false,!m.override_key_set);
+      formField(d,"清除此服务单独保存的 Key",kind,"clear","checkbox",false,!m.override_key_set&&!m.saved_key);
       formField(d,"没有单独 Key 时继承文字服务的 OpenAI Key",kind,"inherit","checkbox",m.inherit,kind==="video");
       formField(d,"音色名称",kind,"voice","text",m.voice,kind!=="tts");
-      d.append(el("p","muted",kind==="video"?"OpenAI 已停用视频接口。这里可预填其他供应商信息，本版不会发视频请求。":
-        m.key_set?(m.override_key_set?"使用服务专用 Key。":"继承文字服务的 OpenAI Key。"):"Key 未配置。"));
+      const keyStatus=el("p","muted",statusText(kind,m));
+      keyStatus.id=kind+"-key-status";d.append(keyStatus);
       panel.append(d);
+    }
+  }
+  function statusText(kind,m){
+    if(kind==="video")return "OpenAI 已停用视频接口。这里可预填其他供应商信息，本版不会发视频请求。";
+    return m.key_set?(m.override_key_set?"使用已加密保存的服务专用 Key。":"继承文字服务的 OpenAI Key。"):"Key 未配置。";
+  }
+  async function refreshKeys(){
+    options=await api("/settings/media");
+    for(const [kind,m] of Object.entries(options.services)){
+      const label=$(kind+"-key-status");if(label)label.textContent=statusText(kind,m);
     }
   }
   async function load(render=true){const cfg=await api("/settings/media");if(render)fill(cfg);else options=cfg;}
@@ -88,31 +101,39 @@ window.mediaUI=(()=>{
       proactive_images:$("proactive-images").checked}));notice("语音与媒体设置已保存。",true);}
     catch(err){notice(err.message);}
   };
-  function clearDraft(){
+  function clearDraft(expected){
+    if(expected&&expected!==draft)return;
     if(draftURL)URL.revokeObjectURL(draftURL);
-    draftURL=null;draft=null;$("draft-audio").removeAttribute("src");$("rec-preview").hidden=true;
+    draftURL=null;draft=null;draftRequest=null;attemptedDraft=false;
+    $("draft-audio").removeAttribute("src");$("rec-preview").hidden=true;
+    $("send-audio").textContent="发送语音";
   }
   function recordNote(value){$("rec-status").textContent=value;$("rec-status").hidden=!value;}
   $("discard-audio").onclick=()=>{if(!busy)clearDraft();};
   $("send-audio").onclick=()=>{
-    if(!draft||busy||pending)return;
-    pending={audio:draft,request_id:rid()};send();
+    if(!draft||busy)return;
+    draftRequest??=requestId();
+    const expected=draft;
+    send({audio:draft,request_id:draftRequest}).finally(()=>{
+      if(draft===expected){attemptedDraft=true;$("send-audio").textContent="重试语音";}
+    });
   };
   async function submitAudio(pending){
     const r=await fetch("/api/chat/audio",{method:"POST",headers:{"Content-Type":pending.audio.type,
       "X-Request-Id":pending.request_id},body:pending.audio});
-    const result=await r.json();
+    const result=await r.json().catch(()=>({}));
     if(!r.ok)throw Error(typeof result.detail==="string"?result.detail:"这段语音没能发送。");
     return result;
   }
   $("mic").onclick=async()=>{
     if(recorder?.state==="recording"){recorder.stop();return;}
-    if(busy||pending)return;
+    if(busy)return;
+    if(draft){notice(attemptedDraft?"这段录音还在，可以重试或先丢弃。":"请先发送或丢弃这段录音。");return;}
     if(setup?.mode!=="openai"||!options?.services?.stt?.enabled||!options.services.stt.key_set){
       notice("录音转写未开启。到设置启用语音识别并配置 Key，或继续打字。");return;
     }
     if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder){
-      notice("当前浏览器不支持录音。请在 Mac 浏览器打开本地页面。");return;
+      notice("当前浏览器不支持录音。请用支持麦克风的浏览器打开晚灯。");return;
     }
     let mic;
     try{
@@ -136,5 +157,5 @@ window.mediaUI=(()=>{
     }catch(err){mic?.getTracks().forEach(t=>t.stop());notice("未能使用麦克风。检查浏览器权限，或继续打字。");}
     finally{$("mic").disabled=false;}
   };
-  return {display,poll,load,clearDraft,submitAudio,leaveChat:()=>{if(recorder?.state==="recording")recorder.stop();}};
+  return {display,poll,load,refreshKeys,clearDraft,submitAudio,leaveChat:()=>{if(recorder?.state==="recording")recorder.stop();}};
 })();

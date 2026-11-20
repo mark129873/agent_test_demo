@@ -42,6 +42,11 @@ class MediaFailure(Exception):
     pass
 
 
+def timeout_message(service):
+    label=SERVICES[service][0]
+    return f"{label}等待超时。这次没有自动重试，聊天仍可继续。"
+
+
 def intent(text):
     """Only direct requests may bypass the separate proactive-image opt-in."""
     photo=video=negated=False
@@ -158,7 +163,7 @@ async def openai_media(service, setup, key, payload):
     if service == "tts":
         return await audio_reply(setup,key,payload["text"],payload["tone"])
     try:
-        async with httpx.AsyncClient(timeout=90 if service=="image" else 35,follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=150 if service=="image" else 35,follow_redirects=False) as client:
             if service == "stt":
                 r = await client.post(setup["base_url"] + "/audio/transcriptions", headers=headers,
                     data={"model":setup["model"]},files={"file":("voice."+AUDIO_TYPES[payload["mime"]],payload["data"],payload["mime"])})
@@ -180,5 +185,7 @@ async def openai_media(service, setup, key, payload):
         if not image.startswith(b"\xff\xd8\xff") or len(image)>MAX_ASSET:
             raise ValueError("invalid image")
         return "image/jpeg",image
+    except httpx.TimeoutException:
+        raise MediaFailure(timeout_message(service)) from None
     except (httpx.HTTPError,ValueError,KeyError,IndexError,TypeError,AttributeError,ImportError):
         raise MediaFailure(f"{SERVICES[service][0]}没有返回有效结果，请检查设置或稍后再试。") from None

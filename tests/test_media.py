@@ -20,6 +20,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.db=Path(temp.name)/"media.sqlite3"
         self.calls=[]
         self.failed=set()
+        self.timed_out=set()
         self.release=asyncio.Event()
         self.release.set()
 
@@ -27,6 +28,8 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append((service,key,payload))
             if service!="stt":
                 await self.release.wait()
+            if service in self.timed_out:
+                raise TimeoutError
             if service in self.failed:
                 raise MediaFailure(f"{service} 模拟服务失败")
             if service=="stt":
@@ -135,6 +138,19 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("api_key",cfg["services"]["stt"])
         cfg["services"]["image"]["base_url"]="https://example.com/v1"
         self.assertEqual((await self.client.put("/api/settings/media",json=cfg)).status_code,400)
+
+    async def test_photo_timeout_keeps_text_and_does_not_retry_provider(self):
+        await self.configure()
+        self.timed_out={"image"}
+        wanted="能发一张你做的番茄鸡蛋面的照片吗？"
+        first=await self.message(wanted,"photo-timeout")
+        rows=await self.attached()
+        self.assertEqual(rows[-1]["text"],first["text"])
+        self.assertEqual(rows[-1]["attachments"][0]["state"],"failed")
+        self.assertIn("照片生成等待超时",rows[-1]["attachments"][0]["error"])
+        await self.message(wanted,"photo-timeout")
+        await self.message("那我们接着聊天吧。","after-photo-timeout")
+        self.assertEqual([call[0] for call in self.calls],["image"])
 
     async def test_offline_and_unconfigured_never_call_provider(self):
         cfg=(await self.client.get("/api/settings")).json()

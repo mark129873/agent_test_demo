@@ -11,12 +11,44 @@ from unittest.mock import patch
 
 import aiohttp
 import httpx
+from PIL import Image
 
 from app import create_app
-from media import MediaFailure, audio_reply, image_prompt, intent, pcm_wav, text_only_turn, tone_for
+from media import MediaFailure, audio_reply, image_prompt, intent, openai_media, pcm_wav, text_only_turn, tone_for
 
 SAMPLE_AUDIO=pcm_wav(b"\x00\x00"*1000)
-SAMPLE_JPEG=b"\xff\xd8\xff\xdbTEST\xff\xd9"
+
+
+def make_jpeg_bytes(size=(16,16)):
+    buffer = io.BytesIO()
+    with Image.new("RGB",size,color=(86,77,61)) as image:
+        image.save(buffer,format="JPEG")
+    return buffer.getvalue()
+
+
+SAMPLE_JPEG=make_jpeg_bytes()
+
+
+class ImageTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def render(self, jpeg):
+        def response(request):
+            self.assertEqual(request.url.path,"/v1/images/generations")
+            return httpx.Response(200,json={"data":[{"b64_json":base64.b64encode(jpeg).decode()}]})
+
+        transport = httpx.MockTransport(response)
+        async_client = httpx.AsyncClient(transport=transport)
+        with patch("media.httpx.AsyncClient",return_value=async_client):
+            return await openai_media("image",{"base_url":"https://api.openai.com/v1","model":"synthetic-img"},
+                                      "synthetic-key",{"scene":"home","detail":"雨窗饺子"})
+
+    async def test_accepts_decodable_jpeg(self):
+        self.assertEqual(await self.render(SAMPLE_JPEG),("image/jpeg",SAMPLE_JPEG))
+
+    async def test_rejects_header_only_truncated_or_oversized_jpeg(self):
+        for jpeg in (b"\xff\xd8\xff\xdbTEST\xff\xd9", SAMPLE_JPEG[:-2],
+                     SAMPLE_JPEG[:200]+b"\xff\xd9",make_jpeg_bytes((4097,1))):
+            with self.subTest(length=len(jpeg)), self.assertRaisesRegex(MediaFailure,"没有返回有效结果"):
+                await self.render(jpeg)
 
 
 class AudioTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -397,26 +429,57 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_text_only_override_never_calls_tts_and_preserves_mode(self):
         await self.configure("both", proactive=True)
-        reply = await self.message("不用再发图。这次就回一小句文字，不要语音：饺子今晚又赢了",
-                                   "media-turn-text-override")
-        self.assertTrue(reply["text"])
-        self.assertEqual(reply["attachments"], [])
-        self.assertEqual(self.calls, [])
+        for i, text in enumerate((
+            "不用再发图。这次就回一小句文字，不要语音：饺子今晚又赢了",
+            "我在地铁上，给我发文字就好。",
+            "这次请用文字回复我，我不方便听语音。",
+            "车上太吵啦，我不方便听语音。",
+        )):
+            reply = await self.message(text, f"media-turn-text-override-{i}")
+            self.assertTrue(reply["text"])
+            self.assertEqual(reply["attachments"], [])
+            self.assertEqual(self.calls, [])
         cfg = (await self.client.get("/api/settings/media")).json()
         self.assertEqual(cfg["reply_mode"], "both")
         await self.message("好啦，我们继续聊天。", "media-turn-after-override")
         self.assertEqual((await self.attached())[-1]["attachments"][0]["presentation"], "both")
         self.assertEqual([c[0] for c in self.calls], ["tts"])
 
+    async def test_current_photo_opt_out_blocks_proactive_then_resumes(self):
+        await self.configure("text", proactive=True)
+        for i, request in enumerate((
+            "晚饭吃了饺子，今天不想看照片。",
+            "晚饭刚吃完，这次别给我发图。",
+            "我在做晚饭，我今晚不想看照片。",
+        )):
+            reply = await self.message(request, f"media-turn-photo-override-{i}")
+            self.assertTrue(reply["text"])
+            self.assertEqual(reply["attachments"], [])
+            self.assertEqual(self.calls, [])
+        await self.message("晚饭吃了饺子，你呢？", "media-turn-after-photo-override")
+        self.assertEqual((await self.attached())[-1]["attachments"][0]["kind"], "image")
+        self.assertEqual([c[0] for c in self.calls], ["image"])
+
     def test_text_only_intents_distinguish_directives_from_mentions(self):
         for text in ("这次只用文字回复。", "不要语音。", "这次不用发语音", "就回一小句文字"):
             with self.subTest(text=text):
                 self.assertTrue(text_only_turn(text))
-        for text in ("文字", "我不常发语音。", "你可以发语音。", "不要语音识别出错。",
+        for text in ("文字", "我不常发语音。", "你可以发语音。", "不要语音识别出错。", "他不方便听语音。",
                      "例如，不要语音可以写成「禁用语音」。", "例如：不要语音。", "她说，不用语音。", "她说“不用语音”。",
                      "如果只用文字回复，会是什么感觉？"):
             with self.subTest(text=text):
                 self.assertFalse(text_only_turn(text))
+
+    def test_photo_intents_ignore_negations_in_quotes_hypotheticals_and_reports(self):
+        for text in ("晚饭吃了饺子。她说：今天不想看照片。", "比如：今天不想看照片。",
+                     "假如我在地铁上，今天不想看照片。", "她说“今天不想看照片”。",
+                     "不要发照片失败。"):
+            with self.subTest(text=text):
+                self.assertFalse(intent(text)["negated"])
+                self.assertFalse(intent(text)["photo"])
+        for text in ("比如：发张照片看看。", "她昨天说，发张照片看看。"):
+            with self.subTest(text=text):
+                self.assertFalse(intent(text)["photo"])
 
     def test_tone_honors_negation_and_a_confirmed_outcome(self):
         self.assertEqual(tone_for("终于通过了，刚才还紧张得不行"), "bright")

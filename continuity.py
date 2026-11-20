@@ -64,15 +64,15 @@ def assemble(con, snap, user_id, context, budget=CONTEXT_BUDGET):
             out[field].append(entry)
             if payload_bytes(out)>budget:
                 out[field].pop()
+    if snap["summary"]:
+        out["history_summary"] = snap["summary"]
+        if payload_bytes(out)>budget:
+            out.pop("history_summary")
     for turn in complete_recent(con,snap["floor"],snap["covered"],user_id):
         out["recent"] = turn + out["recent"]
         if payload_bytes(out)>budget:
             out["recent"] = out["recent"][len(turn):]
             break
-    if snap["summary"]:
-        out["history_summary"] = snap["summary"]
-        if payload_bytes(out)>budget:
-            out.pop("history_summary")
     return out
 
 def compaction_input(con):

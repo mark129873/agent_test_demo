@@ -7,8 +7,9 @@ window.mediaUI=(()=>{
   function display(row,{transcriptOpen=false}={}){
     const block=el("div","message-content"), assets=chatAssets(row);
     const voice=assets.find(a=>a.kind==="tts"&&a.presentation==="voice");
+    let details;
     if(voice&&(voice.state==="ready"||voice.state==="pending")){
-      const details=el("details","transcript");
+      details=el("details","transcript");
       details.open=transcriptOpen;
       details.append(el("summary",null,"查看文字"),el("div","bubble",row.text));block.append(details);
     }else block.append(el("div","bubble",row.text));
@@ -18,29 +19,42 @@ window.mediaUI=(()=>{
       if(a.state==="failed")card.append(el("span",null,a.error||"这项媒体暂不可用。"));
       if(a.state==="removed"){
         const clip=clips.get(a.id);
-        if(clip){clip.pause();clip.removeAttribute("src");clips.delete(a.id);}
+        if(clip){clip.onerror=null;clip.pause();clip.removeAttribute("src");clips.delete(a.id);}
         const marker=el("span","attachment-removed-marker","已移除本地附件");
         marker.dataset.removedAttachmentId=String(a.id);marker.tabIndex=-1;
         card.append(marker);
       }
       if(a.state==="ready"){
         const url="/api/attachments/"+a.id;
+        const kindLabel={recording:"录音",tts:"语音",image:"照片"}[a.kind];
+        const remove=button("移除本地附件","attachment-remove",()=>removeAttachment(a,remove));
+        remove.dataset.removeAttachmentId=String(a.id);
+        remove.setAttribute("aria-label","移除本地"+kindLabel+"附件");
+        const status=el("div","attachment-status");
+        status.setAttribute("role","status");
+        const fail=media=>{
+          if(card.classList.contains("playback-failed"))return;
+          const hadFocus=document.activeElement===media;
+          card.classList.add("playback-failed");
+          status.textContent=a.kind==="image"?"这张照片暂时打不开。":"这段"+kindLabel+"暂时无法播放。";
+          if(a===voice&&details)details.open=true;
+          if(hadFocus)remove.focus({preventScroll:true});
+        };
         if(a.kind==="image"){
-          const image=el("img","photo");image.src=url;image.alt="阿晚分享的照片";image.loading="lazy";
-          card.append(image);
+          const image=el("img","photo");image.alt="阿晚分享的照片";image.loading="lazy";
+          image.onerror=()=>fail(image);
+          card.append(image,status,remove);
+          image.src=url;
         }else{
           const player=clips.get(a.id)||el("audio","voice");
-          if(!player.getAttribute("src"))player.src=url;
           player.controls=true;player.preload="metadata";
           player.setAttribute("aria-label",a.kind==="recording"?"你的录音":"阿晚的语音");
           clips.set(a.id,player);if(clips.size>105)clips.delete(clips.keys().next().value);
-          card.append(player);
+          player.onerror=()=>{if(player.getAttribute("src"))fail(player);};
+          card.append(player,status,remove);
+          if(!player.getAttribute("src"))player.src=url;
+          else if(player.error)fail(player);
         }
-        const remove=button("移除本地附件","attachment-remove",()=>removeAttachment(a,remove));
-        const kindLabel={recording:"录音",tts:"语音",image:"照片"}[a.kind];
-        remove.dataset.removeAttachmentId=String(a.id);
-        remove.setAttribute("aria-label","移除本地"+kindLabel+"附件");
-        card.append(remove);
       }
       block.append(card);
     }

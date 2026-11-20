@@ -234,6 +234,79 @@ def parse_followup_request(source, local_datetime):
             "not_before": checkpoint, "question": question, "ack": ack, "quote": quote}
 
 
+_REVOKE_NOUNS = {
+    "meeting": r"会议|开会|那场会|这场会",
+    "interview": r"面试",
+    "presentation": r"(?:工作)?汇报",
+}
+_REVOKE_VERB = r"(?:不用|不要|别|不必)(?:再|主动)?(?:来)?问我"
+_FOLLOWUP_NEGATION = r"取消(?:一下|掉)?(?:那条|这条|明天的)?(?:回访|问候)|不想(?:再)?被问"
+
+
+def parse_followup_revocation(source, local_datetime):
+    """Parse an explicit topic-scoped opt-out. Do not treat ordinary dislikes as revocations."""
+    for fragment in re.finditer(r"[^，。！？；、,.!?;\n]+[？?]?", source):
+        clause = fragment[0].strip()
+        verb = re.search(rf"{_REVOKE_VERB}|{_FOLLOWUP_NEGATION}", clause)
+        if not verb:
+            continue
+        before = source[:fragment.start()] + clause[:verb.start()]
+        if (re.search(ASSUME, before + clause) or re.search(UNCERTAIN, clause)
+                or re.search(r"说[:：]\s*$|(?:他说|她说|同事说|朋友说)[：:「“]", before)
+                or any(before.count(a) > before.count(b) for a,b in (("“","”"),("「","」"),("『","』"),("‘","’")))
+                or before.count('"') % 2
+                or re.search(r"吗[？?]?\s*$", clause)):
+            continue
+        # A later unrelated prohibition (e.g. '别问我同事那件事') cannot
+        # silently disable another scheduled event.
+        topic = [key for key, noun in _REVOKE_NOUNS.items() if re.search(noun, clause)]
+        if "meeting" in topic and "presentation" in topic:
+            return {}
+        if len(topic) != 1:
+            if topic or re.search(r"回访|问候|(?:这|那)(?:一)?件事|(?:这|那)场|(?:怎么样|怎样|如何)了$", clause):
+                return {}
+            continue
+        if re.search(_PERMISSION, clause[verb.end():]):
+            return {}
+        if re.fullmatch(_REVOKE_VERB, verb[0]):
+            noun = _REVOKE_NOUNS[topic[0]]
+            date_token = rf"(?:{_MORNING_TOMORROW}|{DATE_PATTERN})"
+            left = clause[:verb.start()].strip()
+            right = clause[verb.end():].strip()
+            if not re.fullmatch(rf"(?:但|不过|那就|我觉得|真的|其实|就)?(?:{date_token}(?:的)?)?(?:(?:{noun})(?:的)?(?:事|回访|问候)?)?", left):
+                continue
+            followup_topic = rf"(?:{date_token}(?:的)?)?(?:{noun})?(?:的(?:事|情况|结果)|(?:讲|说|考|做)(?:得)?(?:怎么样|怎样|如何)|怎么样|怎样|如何|结果|回访|问候)?(?:了|啦|吧)?[？?]?"
+            if not re.fullmatch(followup_topic, right):
+                continue
+        dates = _date_values(clause, local_datetime.date())
+        if re.search(_MORNING_TOMORROW, clause):
+            dates.append((local_datetime.date() + timedelta(days=1)).isoformat())
+        if len(set(dates)) > 1:
+            return {}
+        return {"key": topic[0], "date": dates[0] if dates else None, "quote": clause}
+    return None
+
+
+def revoke_followup_request(con, spec, user_id, now):
+    """Mute exactly one still-pending explicit opt-in and invalidate any in-flight open."""
+    if not con.in_transaction:
+        con.execute("BEGIN IMMEDIATE")
+    key, day = spec["key"], spec["date"]
+    rows = con.execute("""SELECT event_id,version,source_id FROM events
+        WHERE status='pending' AND followup_question IS NOT NULL AND not_before IS NOT NULL
+          AND (key=? OR key LIKE (? || ':%')) AND (? IS NULL OR event_date=?)
+        ORDER BY event_id""", (key,key,day,day)).fetchall()
+    if len(rows) > 1:
+        return "ambiguous"
+    if not rows or rows[0][2] > user_id:
+        return "closed"
+    event_id, version, _ = rows[0]
+    changed = con.execute("""UPDATE events SET status='muted',version=version+1,source_id=?,
+        quote=?,updated_at=? WHERE event_id=? AND version=? AND status='pending'""",
+        (user_id,spec["quote"],now,event_id,version)).rowcount
+    return "revoked" if changed else "closed"
+
+
 def save_followup_request(con, spec, user_id, now):
     """Attach one explicit ask to the correlated event, without re-arming it."""
     key, day = spec["key"], spec["date"]

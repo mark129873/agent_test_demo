@@ -5,3 +5,4 @@ tzdata
 pydantic>=2,<3
 aiohttp>=3.12,<4
 cryptography>=42,<48
+Pillow>=11,<14

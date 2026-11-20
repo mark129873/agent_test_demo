@@ -8,26 +8,30 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Literal
 
 from agent import ModelFailure, candidates, recall, respond, simulate
+from attachment_http import serve_attachment
 from continuity import (SCHEMA as CONTINUITY_SCHEMA, assemble, commit_summary,
                         compaction_input, reset_summary, retire_context, state)
 from credentials import Credentials, CredentialStoreError
 from events import (EVENT_NAMES, migrate_events, apply_event, parse_followup_request,
-                    save_followup_request)
+                    parse_followup_revocation, revoke_followup_request, save_followup_request)
 from media import (AUDIO_TYPES, MAX_ASSET, MAX_INPUT_AUDIO, OPENAI_URL, SCENES, SERVICES,
                    MediaFailure, intent, openai_media, photo_detail, scene_hint, text_only_turn, timeout_message, tone_for)
+from quiet_topics import (QUIET_SCHEMA, active_quiet_topics, contains_quiet_topic,
+                          filter_context, remember_quiet_topics)
 
 DIR = Path(__file__).resolve().parent
 MAX_MEDIA_STORAGE = 384 * 1024 * 1024
 MEDIA_FULL = "本机媒体空间已满。可移除不需要的附件；文字聊天不受影响。"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, role TEXT NOT NULL, text TEXT NOT NULL,
- created_at TEXT NOT NULL, request_id TEXT UNIQUE, reply_to INTEGER UNIQUE REFERENCES messages(id));
+ created_at TEXT NOT NULL, request_id TEXT UNIQUE, reply_to INTEGER UNIQUE REFERENCES messages(id),
+ user_timezone TEXT);
 CREATE TABLE IF NOT EXISTS memories(key TEXT PRIMARY KEY, value TEXT NOT NULL,
  source_id INTEGER NOT NULL REFERENCES messages(id), quote TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(key TEXT PRIMARY KEY, label TEXT NOT NULL, event_date TEXT NOT NULL,
@@ -78,7 +82,7 @@ class Abandon(BaseModel):
     request_id: str = Field(min_length=8,max_length=80)
 
 def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_media):
-    db_path = Path(db_path or os.getenv("COMPANION_DB", DIR / "companion.sqlite3"))
+    db_path = database_path(db_path)
     for name in (db_path,Path(str(db_path)+"-wal"),Path(str(db_path)+"-shm")):
         try:
             fd=os.open(name,os.O_RDWR|os.O_NOFOLLOW|(os.O_CREAT if name==db_path else 0),0o600)
@@ -121,7 +125,9 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
 
     with db() as con:
         con.execute("PRAGMA journal_mode=WAL")
-        con.executescript(SCHEMA + CONTINUITY_SCHEMA)
+        con.executescript(SCHEMA + CONTINUITY_SCHEMA + QUIET_SCHEMA)
+        if "user_timezone" not in {r["name"] for r in con.execute("PRAGMA table_info(messages)")}:
+            con.execute("ALTER TABLE messages ADD COLUMN user_timezone TEXT")
         migrate_events(con)
         try:
             restored=credential_store.load(con)
@@ -173,6 +179,8 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
         if summary_task is not None and not summary_task.done():
             return
         with db() as con:
+            if active_quiet_topics(con,clock()):
+                return
             item = compaction_input(con)
         if item is None:
             return
@@ -453,13 +461,11 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                     service_keys[service]=setting.api_key.strip()
         return get_media_settings()
 
-    @app.get("/api/attachments/{attachment_id}")
-    def fetch_attachment(attachment_id: int):
+    @app.api_route("/api/attachments/{attachment_id}", methods=["GET","HEAD"])
+    def fetch_attachment(attachment_id: int, request: Request):
         with db() as con:
-            asset=con.execute("SELECT mime,body FROM attachments WHERE id=? AND state='ready'",(attachment_id,)).fetchone()
-            if not asset:
-                raise HTTPException(404,"该附件还不可用。")
-            return Response(content=asset["body"],media_type=asset["mime"],headers={"X-Content-Type-Options":"nosniff","Cache-Control":"no-store"})
+            range_header=None if request.headers.get("if-range") else request.headers.get("range")
+            return serve_attachment(con,attachment_id,range_header,head=request.method=="HEAD")
 
     @app.delete("/api/attachments/{attachment_id}")
     async def remove_attachment(attachment_id: int):
@@ -539,12 +545,15 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                 return saved["id"],saved["created_at"],source
             if original_audio and media_bytes(con)+len(original_audio[1])>MAX_MEDIA_STORAGE:
                 raise HTTPException(409,MEDIA_FULL)
-            sent=clock().isoformat()
-            user_id=con.execute("INSERT INTO messages(role,text,created_at,request_id) VALUES('user',?,?,?)",
-                                (source,sent,body.request_id)).lastrowid
+            now=clock()
+            sent=now.isoformat()
+            zone=cfg(con)["timezone"]
+            user_id=con.execute("INSERT INTO messages(role,text,created_at,request_id,user_timezone) VALUES('user',?,?,?,?)",
+                                (source,sent,body.request_id,zone)).lastrowid
             if original_audio:
                 asset=attachment(con,user_id,"recording","ready")
                 con.execute("UPDATE attachments SET mime=?,body=? WHERE id=?",(*original_audio,asset))
+            remember_quiet_topics(con,source,now.astimezone(ZoneInfo(zone)))
             activity+=1
             return user_id,sent,source
 
@@ -575,8 +584,20 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                 media_context = intent(source)
                 media_context["proactive"] = media_settings(con)["proactive_images"]
                 facts = records(con,"SELECT key,value FROM memories ORDER BY updated_at DESC")
-                local_sent=datetime.fromisoformat(sent).astimezone(ZoneInfo(setup["timezone"]))
+                original_zone=con.execute("SELECT user_timezone FROM messages WHERE id=?",(user_id,)).fetchone()[0]
+                local_sent=datetime.fromisoformat(sent).astimezone(ZoneInfo(original_zone or setup["timezone"]))
                 day=local_sent.date()
+                revocation=parse_followup_revocation(source,local_sent)
+                if revocation is not None:
+                    status=revoke_followup_request(con,revocation,user_id,clock().isoformat()) if revocation else "ambiguous"
+                    reply={
+                        "revoked":"好，那件事我就不再追问了。",
+                        "ambiguous":"好，你说的是哪一件？告诉我个时间或场次就行。",
+                        "closed":"好，这件事没有待问的安排，我就不追问了。",
+                    }[status]
+                    con.execute("INSERT INTO messages(role,text,created_at,reply_to) VALUES('assistant',?,?,?)",
+                                (reply,clock().isoformat(),user_id))
+                    return chat_page(con)
                 followup_request=parse_followup_request(source,local_sent)
                 events=[]
                 for event in con.execute("""SELECT event_id,key,label,event_date,status FROM events
@@ -587,8 +608,10 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                         events.append(dict(event))
                     if len(events)>=4:
                         break
-                context = assemble(con,snap,user_id,{"type":"user_message","message":source,
-                           "local_date":day.isoformat(),"facts":recall(source,facts),"events":events,"media":media_context})
+                topics=active_quiet_topics(con,clock())
+                model_input={"type":"user_message","message":source,
+                             "local_date":day.isoformat(),"facts":recall(source,facts),"events":events,"media":media_context}
+                context=filter_context(assemble(con,snap,user_id,filter_context(model_input,topics)),topics)
             try:
                 async with asyncio.timeout(35):
                     result = await model_call(setup,chat_key,context)
@@ -600,6 +623,9 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                     raise HTTPException(409,"对话期间修改了记忆，旧回复已丢弃。你可以重新发一条消息。")
                 if con.execute("SELECT 1 FROM abandoned_turns WHERE message_id=?",(user_id,)).fetchone():
                     raise HTTPException(409,"已停止等待这条回复。")
+                topics=active_quiet_topics(con,clock())
+                if contains_quiet_topic(result.get("reply"),topics):
+                    result={**result,"reply":"好，我们聊点别的。","patches":[],"photo_scene":None}
                 reset = False
                 if followup_request is not None:
                     if followup_request:
@@ -633,7 +659,7 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                     # Later queued user messages already have IDs, and should
                     # continue with the corrected facts rather than be archived.
                     invalidate_context(con,user_id)
-                jobs = plan_media(con,mid,source,result,setup)
+                jobs = plan_media(con,mid,filter_context({"message":source},topics)["message"],result,setup)
                 response = chat_page(con)
             launch(jobs)
             maybe_summarize(setup,chat_key)
@@ -650,10 +676,13 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
             local=clock().astimezone(ZoneInfo(setup["timezone"]))
             day=body.demo_date or local.date()
             stamp=f"{day.isoformat()}T{local:%H:%M}"
-            event = con.execute("""SELECT * FROM events WHERE status='pending' AND event_date>=? AND
+            due = con.execute("""SELECT * FROM events WHERE status='pending' AND event_date>=? AND
                  ((not_before IS NULL AND event_date < ?) OR (not_before IS NOT NULL AND not_before <= ?))
-                 ORDER BY (not_before IS NOT NULL) DESC,event_date DESC,event_id LIMIT 1""",
-                 ((day-timedelta(days=14)).isoformat(),day.isoformat(),stamp)).fetchone()
+                 ORDER BY (not_before IS NOT NULL) DESC,event_date DESC,event_id""",
+                 ((day-timedelta(days=14)).isoformat(),day.isoformat(),stamp))
+            topics=active_quiet_topics(con,local)
+            event=next((candidate for candidate in due if not any(contains_quiet_topic(candidate[field],topics)
+                       for field in ("label","key","followup_question"))),None)
             if not event or opening or turn_lock.locked():
                 return {**chat_page(con),"followup":False}
             watch_activity, watch_epoch = activity, state(con)["epoch"]
@@ -680,6 +709,8 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
             with db() as con:
                 if activity!=watch_activity or state(con)["epoch"]!=watch_epoch:
                     return {**chat_page(con),"followup":False}
+                if contains_quiet_topic(result.get("reply"),active_quiet_topics(con,clock())):
+                    return {**chat_page(con),"followup":False}
                 now = clock().isoformat()
                 updated = con.execute("""UPDATE events SET status='asked',updated_at=?,version=version+1
                     WHERE event_id=? AND version=? AND status='pending'""",(now,event_id,version)).rowcount
@@ -698,6 +729,28 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
     app.mount("/static", StaticFiles(directory=DIR / "static"), name="static")
     return app
 
-if __name__ == "__main__":
+def database_path(db_path=None):
+    return Path(db_path or os.getenv("COMPANION_DB", DIR / "companion.sqlite3"))
+
+
+def serve_local():
+    import fcntl
     import uvicorn
-    uvicorn.run(create_app(), host="127.0.0.1", port=8765)
+    path=database_path()
+    # Keep recovery of interrupted media behind the lifetime lock. Never unlink
+    # the sentinel while running: it must remain one inode across restarts.
+    owner_file=path.parent.resolve()/(path.name+".lock")
+    fd=os.open(owner_file, os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd,0o600)
+        try:
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("这份聊天正在另一晚灯进程中使用，请回到原页面。") from None
+        uvicorn.run(create_app(path),host="127.0.0.1",port=8765)
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    serve_local()

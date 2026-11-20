@@ -10,6 +10,7 @@ from urllib.request import getproxies, proxy_bypass
 
 import aiohttp
 import httpx
+from PIL import Image
 
 OPENAI_URL = "https://api.openai.com/v1"
 SERVICES = {
@@ -35,6 +36,7 @@ AUDIO_TYPES = {
 }
 MAX_INPUT_AUDIO = 6 * 1024 * 1024
 MAX_ASSET = 8 * 1024 * 1024
+MAX_IMAGE_EDGE = 4096
 
 
 class MediaFailure(Exception):
@@ -50,8 +52,8 @@ def _unquoted(text):
     return re.sub(r'“[^”]*”|「[^」]*」|『[^』]*』|‘[^’]*’|"[^"]*"|\x60[^\x60]*\x60', " ", text)
 
 
-def text_only_turn(text):
-    """Honor a direct reply-format choice without changing the saved mode."""
+def _direct_clauses(text):
+    """Exclude quoted and reported/example clauses from paid-media directives."""
     in_example = False
     for fragment in re.split(r"([。！？；.!?;\n]+)|[，、,：:]+", _unquoted(text)):
         if fragment is None:
@@ -60,18 +62,28 @@ def text_only_turn(text):
         if re.fullmatch(r"[。！？；.!?;\n]+", fragment):
             in_example = False
             continue
-        if re.match(r"^(?:例如|比如|假设|假如|如果|举个例|举例|(?:我|他|她|他们|她们|你)(?:刚才|之前|曾经)?(?:说过|说|提到))", clause):
+        if re.match(r"^(?:例如|比如|比方说|假设|假如|如果|引用|举个例|举例|(?:我|他|她|他们|她们|你)(?:刚才|之前|曾经|昨天)?(?:说过|说|提到))", clause):
             in_example = True
-        if in_example:
-            continue
+        if clause and not in_example:
+            yield clause
+
+
+MEDIA_TIME = r"(?:这(?:一)?次|这(?:一)?轮|这一句|现在|今天|今晚|这一条)"
+SHORT_TEXT_ACT = r"(?:用|发(?:给我)?|回(?:我)?|回复(?:我)?|打)"
+
+
+def text_only_turn(text):
+    """Honor a direct reply-format choice without changing the saved mode."""
+    for clause in _direct_clauses(text):
         match = re.fullmatch(
-            r"(?:(?:这(?:一)?次|这(?:一)?轮|这一句|现在|请|麻烦你|你|今天|先)\s*)*"
+            rf"(?:(?:{MEDIA_TIME}|请|麻烦你|你|先|给我)\s*)*"
             r"(?:"
-            r"(?:(?:就|只|仅)\s*(?:用|发|回(?:我)?|回复(?:我)?|打)?|用|发|回(?:我)?|回复(?:我)?|打)\s*"
+            rf"(?:(?:就|只|仅)\s*{SHORT_TEXT_ACT}?|{SHORT_TEXT_ACT})\s*"
             r"(?:一小句|一句|一条|几句|简短的)?\s*(?:纯)?(?:文字|文本)"
-            r"(?:回复|回答|回我)?(?:就好|即可|就行)?"
+            r"(?:回复(?:我)?|回答(?:我)?|回我|给我)?(?:就好|即可|就行)?"
             r"|(?:不要|不用|别|不必|不需要)\s*(?:再|先)?\s*(?:发|用|回|回复|发送|合成|播放)?\s*"
             r"(?:语音(?:消息|回复)?|音频)"
+            r"|(?:我)?(?:现在)?不方便\s*(?:听|播放)\s*(?:语音(?:消息|回复)?|音频)"
             r")[吧啊哈呀哦啦呢好吗]*",
             clause,
         )
@@ -84,7 +96,7 @@ def intent(text):
     """Only direct requests may bypass the separate proactive-image opt-in."""
     photo=video=negated=False
     nouns=r"照片|自拍|张图|图片|视频|短片"
-    for fragment in re.split(r"[，。！？；、,.!?;\n]+",_unquoted(text)):
+    for fragment in _direct_clauses(text):
         clause=fragment.strip(" \t：:～~")
         implicit_window = bool(re.search(
             r"(?:发|拍)(?:一)?张\s*(?:你想象中的)?窗边\s*给我(?:看看|瞧瞧)[吗吧好吗呀]*$",
@@ -93,8 +105,11 @@ def intent(text):
         image_ref = re.search(nouns,clause) or implicit_window
         if not clause or re.search(r"假设|假如|如果|比如|引用|举例",clause):
             continue
-        if (image_ref or re.search(r"发图|拍图",clause)) and re.match(
-            r"^(?:(?:你|请你)\s*)?(?:别|不要|不用|不想)(?:再)?\s*(?:给我\s*)?(?:发|拍|看)",clause
+        if re.fullmatch(
+            rf"(?:(?:{MEDIA_TIME}|我(?:们)?|你|请你?)\s*)*"
+            r"(?:先)?(?:别|不要|不用|不想|不必|不需要)(?:再)?\s*(?:你|给我)?\s*"
+            r"(?:发送|发|拍|给我看|看|接收)\s*(?:给我|任何|一(?:张|段|个)|张)?\s*"
+            r"(?:照片|自拍|图|图片|视频|短片)(?:给我)?[了吧啊哈呀哦啦呢好吗]*(?:因为.+)?",clause
         ):
             negated=True
             continue
@@ -292,11 +307,20 @@ async def openai_media(service, setup, key, payload):
             if not text or len(text)>2400:
                 raise MediaFailure("这段没听清，或者内容过长。可以重录或改用文字。")
             return text
-        image = base64.b64decode(data["data"][0]["b64_json"], validate=True)
-        if not image.startswith(b"\xff\xd8\xff") or len(image)>MAX_ASSET:
+        encoded = data["data"][0]["b64_json"]
+        if not isinstance(encoded,str) or len(encoded)>4*((MAX_ASSET+2)//3):
+            raise ValueError("invalid image size")
+        image = base64.b64decode(encoded, validate=True)
+        if not (image.startswith(b"\xff\xd8\xff") and image.endswith(b"\xff\xd9") and len(image)<=MAX_ASSET):
             raise ValueError("invalid image")
+        # JPEG headers can be valid while compressed pixel data is corrupt.
+        # Limit dimensions before asking Pillow to decode the complete image.
+        with Image.open(io.BytesIO(image),formats=("JPEG",)) as decoded:
+            if not (0<decoded.width<=MAX_IMAGE_EDGE and 0<decoded.height<=MAX_IMAGE_EDGE):
+                raise ValueError("invalid image dimensions")
+            decoded.load()
         return "image/jpeg",image
     except httpx.TimeoutException:
         raise MediaFailure(timeout_message(service)) from None
-    except (httpx.HTTPError,ValueError,KeyError,IndexError,TypeError,AttributeError,ImportError):
+    except (httpx.HTTPError,OSError,Image.DecompressionBombError,ValueError,KeyError,IndexError,TypeError,AttributeError,ImportError):
         raise MediaFailure(f"{SERVICES[service][0]}没有返回有效结果，请检查设置或稍后再试。") from None

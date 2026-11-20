@@ -14,7 +14,7 @@ import httpx
 from PIL import Image
 
 from app import create_app
-from media import MediaFailure, audio_reply, image_prompt, intent, openai_media, pcm_wav, text_only_turn, tone_for
+from media import MediaFailure, align_photo_reply, audio_reply, image_prompt, intent, openai_media, pcm_wav, text_only_turn, tone_for
 
 SAMPLE_AUDIO=pcm_wav(b"\x00\x00"*1000)
 
@@ -27,6 +27,16 @@ def make_jpeg_bytes(size=(16,16)):
 
 
 SAMPLE_JPEG=make_jpeg_bytes()
+
+
+class PhotoReplyTests(unittest.TestCase):
+    def test_normalizes_common_unverified_photo_statuses_but_keeps_conversation(self):
+        for claim in ("我不能发照片。", "我发不出照片。", "我不能拍照给你。", "照片已发送。",
+                      "已经发给你了。", "我保证这张照片一定能送到。"):
+            with self.subTest(claim=claim):
+                self.assertEqual(align_photo_reply(claim+"窗外雨声好轻。",True),"我试试看。窗外雨声好轻。")
+        chat="你说的那扇窗好像我以前见过的。"
+        self.assertEqual(align_photo_reply(chat,True),chat)
 
 
 class ImageTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -225,7 +235,8 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_chat(config,key,context):
             text=context.get("message","")
-            return {"reply":"我陪你坐一会儿。","patches":[],
+            self.chat_context=context
+            return {"reply":getattr(self,"chat_reply","我陪你坐一会儿。"),"patches":[],
                     "photo_scene":"meal" if "晚饭" in text else None}
 
         self.app=create_app(self.db,model_call=fake_chat,media_call=fake_media)
@@ -307,6 +318,36 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["attachments"],[])
         self.assertTrue(result["text"])
         self.assertNotIn("video",(await self.client.get("/api/settings/media")).json()["services"])
+
+    async def test_explicit_photo_reply_agrees_with_attachment_lifecycle(self):
+        self.chat_reply="我不能发照片。窗外下着雨呢。"
+        wanted="发张雨天的窗边照片给我看看。"
+        missing=await self.message(wanted,"photo-contract-missing")
+        self.assertEqual(missing["attachments"][0]["state"],"failed")
+        self.assertNotIn("不能发照片",missing["text"])
+        self.assertFalse(self.chat_context["media"]["photo_available"])
+        self.assertIn("窗外下着雨呢",missing["text"])
+        self.assertEqual(self.calls,[])
+
+        await self.configure()
+        self.release.clear()
+        pending=await self.message(wanted,"photo-contract-pending")
+        self.assertTrue(self.chat_context["media"]["photo_available"])
+        self.assertEqual(pending["attachments"][0]["state"],"pending")
+        self.assertNotIn("不能发照片",pending["text"])
+        self.release.set()
+        ready=(await self.attached())[-1]
+        self.assertEqual((ready["text"],ready["attachments"][0]["state"]),(pending["text"],"ready"))
+        asset=await self.client.get(f"/api/attachments/{ready['attachments'][0]['id']}")
+        self.assertEqual(asset.content,SAMPLE_JPEG)
+
+        self.chat_reply="照片已发送。"
+        self.failed={"image"}
+        scheduled=await self.message(wanted,"photo-contract-provider-failure")
+        self.assertNotIn("已发送",scheduled["text"])
+        failed=(await self.attached())[-1]
+        self.assertEqual((failed["text"],failed["attachments"][0]["state"]),(scheduled["text"],"failed"))
+        self.assertEqual([call[0] for call in self.calls],["image","image"])
 
     async def test_full_local_storage_degrades_and_confirmed_removal_recovers(self):
         from unittest.mock import patch

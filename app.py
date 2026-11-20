@@ -21,7 +21,8 @@ from credentials import Credentials, CredentialStoreError
 from events import (EVENT_NAMES, migrate_events, apply_event, parse_followup_request,
                     parse_followup_revocation, revoke_followup_request, save_followup_request)
 from media import (AUDIO_TYPES, MAX_ASSET, MAX_INPUT_AUDIO, OPENAI_URL, SCENES, SERVICES,
-                   MediaFailure, intent, openai_media, photo_detail, scene_hint, text_only_turn, timeout_message, tone_for)
+                   MediaFailure, align_photo_reply, intent, openai_media, photo_detail, scene_hint, text_only_turn,
+                   timeout_message, tone_for)
 from quiet_topics import (QUIET_SCHEMA, active_quiet_topics, contains_quiet_topic,
                           filter_context, remember_quiet_topics)
 
@@ -262,6 +263,9 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
 
     def media_bytes(con):
         return con.execute("SELECT coalesce(sum(length(body)),0) FROM attachments WHERE state='ready'").fetchone()[0]
+
+    def photo_available(con, options, config):
+        return bool(can_call("image",options,config)) and media_bytes(con)<MAX_MEDIA_STORAGE
 
     def plan_media(con, mid, source, result, config, followup=False):
         options = media_settings(con)
@@ -581,8 +585,6 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                 if user_id<=snap["floor"] or con.execute(
                     "SELECT 1 FROM abandoned_turns WHERE message_id=?",(user_id,)).fetchone():
                     raise HTTPException(409,"这条旧消息不会再发给模型。可以另发一条新消息。")
-                media_context = intent(source)
-                media_context["proactive"] = media_settings(con)["proactive_images"]
                 facts = records(con,"SELECT key,value FROM memories ORDER BY updated_at DESC")
                 original_zone=con.execute("SELECT user_timezone FROM messages WHERE id=?",(user_id,)).fetchone()[0]
                 local_sent=datetime.fromisoformat(sent).astimezone(ZoneInfo(original_zone or setup["timezone"]))
@@ -609,6 +611,11 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                     if len(events)>=4:
                         break
                 topics=active_quiet_topics(con,clock())
+                media_context = intent(filter_context({"message":source},topics)["message"])
+                options = media_settings(con)
+                media_context["proactive"] = options["proactive_images"]
+                if media_context["photo"]:
+                    media_context["photo_available"] = photo_available(con,options,setup)
                 model_input={"type":"user_message","message":source,
                              "local_date":day.isoformat(),"facts":recall(source,facts),"events":events,"media":media_context}
                 context=filter_context(assemble(con,snap,user_id,filter_context(model_input,topics)),topics)
@@ -653,13 +660,17 @@ def create_app(db_path=None, model_call=respond, clock=None, media_call=openai_m
                         clarification=apply_event(con,kind,key,value,quote,user_id,now)
                         if clarification:
                             result={**result,"reply":clarification}
+                media_source=filter_context({"message":source},topics)["message"]
+                if intent(media_source)["photo"]:
+                    result={**result,"reply":align_photo_reply(
+                        result["reply"],photo_available(con,media_settings(con),setup))}
                 mid = con.execute("INSERT INTO messages(role,text,created_at,reply_to) VALUES('assistant',?,?,?)",
                             (result["reply"],now,user_id)).lastrowid
                 if reset:
                     # Later queued user messages already have IDs, and should
                     # continue with the corrected facts rather than be archived.
                     invalidate_context(con,user_id)
-                jobs = plan_media(con,mid,filter_context({"message":source},topics)["message"],result,setup)
+                jobs = plan_media(con,mid,media_source,result,setup)
                 response = chat_page(con)
             launch(jobs)
             maybe_summarize(setup,chat_key)

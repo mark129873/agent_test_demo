@@ -132,6 +132,24 @@ def intent(text):
     return {"video":video,"photo":photo and not video,"negated":negated and not (photo or video)}
 
 
+def align_photo_reply(reply, available):
+    """Attachment cards own delivery status; keep unrelated conversation."""
+    noun = r"照片|图片|自拍|拍照|这张图|那张图"
+    denied = r"(?:没法(?:儿)?|没有办法|无法|不能|不可以|做不到|不支持|不具备|(?:发|拍|传)(?:不了|不出(?:来)?))"
+    sent = r"(?:已(?:经)?|刚刚?|方才)\s*(?:给你|帮你)?\s*(?:发(?:送)?|传|拍|生成)|(?:发(?:送)?|传|拍|生成)(?:给你|过去|出来)?(?:好了|完了|成功了|了)"
+    claim = re.compile(rf"(?:{denied}|{sent}).{{0,24}}(?:{noun})|(?:{noun}).{{0,24}}(?:{denied}|{sent})"
+                       r"|(?:已经|刚刚)\s*(?:给你)?(?:发|传)(?:给你|过去)?(?:了|啦)|(?:发|传)(?:给你|过去)(?:了|啦)"
+                       r"|(?:保证|肯定|一定).{0,24}(?:送到|发出|发给你|收到|收得到)")
+    sentences = re.split(r"(?<=[。！？!?；;\n])", reply)
+    acknowledgement = "我试试看。" if available else "这次先聊聊它吧。"
+    replacement_used = False
+    for index, sentence in enumerate(sentences):
+        if claim.search(sentence):
+            sentences[index] = acknowledgement if not replacement_used else ""
+            replacement_used = True
+    return "".join(sentences).strip()
+
+
 def tone_for(text):
     text = _unquoted(text)
     negated = r"(?:没有|没|不|未)\s*(?:能|成功|觉得|那么|怎么)?\s*(?:开心|通过(?:了)?|太好(?:了)?|庆祝|好消息)"

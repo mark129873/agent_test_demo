@@ -2,19 +2,21 @@
 
 阿晚是一个虚构的成年角色。这是面试题的第一阶段：文字聊天、长期记忆、改期更新和主动回访。不包含语音、照片、视频或数字人渲染，不是原题全部功能。
 
-## 启动
+## macOS 启动
 
-Python 3.11 或 3.12。解压源码后，在 PowerShell 进入本目录：
+需要 Python 3.11 或 3.12。打开「终端」，进入刚解压或克隆的项目目录：
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe app.py
+```bash
+cd /你的路径/agent_test_demo
+python3 --version
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python app.py
 ```
 
-如果安装的是 Python 3.11，第一条改为 `py -3.11`。macOS/Linux 用 `python3 -m venv .venv`，后两条的解释器改为 `.venv/bin/python`。打开 http://127.0.0.1:8765/ 。关闭终端服务后重跑最后一条即可，记忆保留在本目录的 `companion.sqlite3`。仅本机、单用户、单进程运行，不要直接暴露到公网。
+如果 `python3` 不是 3.11 或 3.12，请用对应的 `python3.11` 或 `python3.12` 创建虚拟环境。然后在 Mac 浏览器打开 http://127.0.0.1:8765/ 。用 `Ctrl+C` 停止后端；下次只需在项目目录执行 `.venv/bin/python app.py`。记忆会保存在 `companion.sqlite3`。仅本机、单用户、单进程运行，不要直接暴露到公网。
 
-默认是**离线模拟**，不需 Key、不调用模型。模拟模式是演示测试数据流的轻量规则，不代表真正的理解或模型回复质量。真实聊天：打开「设置」，配置 OpenAI 官方 API 地址、账号可用的模型名和自己的 Key，手动切换到 OpenAI。模型须支持 Chat Completions JSON 模式。真实请求会把本轮内容和相关上下文发往 OpenAI，且可能计费。Key 不回显、不落盘；重启可重新输入，或在启动前把 Key 放到 `OPENAI_API_KEY` 环境变量里。打包文件没有 Key 或数据库。
+默认是**离线模拟**，不需 Key、不调用模型。模拟模式是演示测试数据流的轻量规则，不代表真正的理解或模型回复质量。真实聊天：打开「设置」，配置 OpenAI 官方 API 地址、账号可用的模型名（默认 `gpt-6-luna`）和自己的 Key，手动切换到 OpenAI。模型须支持 Chat Completions JSON 模式。真实请求会把本轮内容和相关上下文发往 OpenAI，且可能计费。Key 不回显、不落盘；重启可重新输入，或在启动前把 Key 放到 `OPENAI_API_KEY` 环境变量里。打包文件没有 Key 或数据库。
 
 ## 现场验收
 

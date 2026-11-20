@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS events(key TEXT PRIMARY KEY, label TEXT NOT NULL, eve
  updated_at TEXT NOT NULL, followup_id INTEGER REFERENCES messages(id));
 CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
-DEFAULTS = {"mode":"mock", "base_url":"https://api.openai.com/v1", "model":"gpt-4o-mini", "timezone":"Asia/Shanghai"}
+DEFAULTS = {"mode":"mock", "base_url":"https://api.openai.com/v1", "model":"gpt-6-luna", "timezone":"Asia/Shanghai"}
 
 class Send(BaseModel):
     text: str = Field(min_length=1, max_length=2400)

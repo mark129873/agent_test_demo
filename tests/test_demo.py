@@ -102,10 +102,14 @@ class DemoTests(unittest.TestCase):
 
     def test_guards_and_settings(self):
         setup = self.client.get("/api/settings").json()
+        self.assertEqual(setup["model"], "gpt-6-luna")
+        self.assertFalse(setup["key_set"])
         setup["api_key"] = "key-for-local-test"
         self.assertTrue(self.client.put("/api/settings",json=setup).json()["key_set"])
         self.assertNotIn("key-for-local-test",self.db.read_bytes().decode('utf-8',errors='ignore'))
         self.assertNotIn("api_key",self.client.get("/api/settings").json())
+        self.assertTrue(self.client.put("/api/settings",json={**setup,"api_key":None}).json()["key_set"])
+        self.assertFalse(self.client.put("/api/settings",json={**setup,"api_key":""}).json()["key_set"])
         self.assertEqual(self.client.post("/api/chat/open",json={},headers={"Origin":"https://example.com"}).status_code,403)
         self.assertEqual(self.client.put("/api/settings",json={**setup,"base_url":"https://example.com/v1"}).status_code,400)
         self.assertEqual(self.client.put("/api/settings",json={**setup,"mode":"openai"}).status_code,200)

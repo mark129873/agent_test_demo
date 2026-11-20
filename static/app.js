@@ -49,6 +49,18 @@ function renderMessages(messages){
 function rememberedTitle(key){
   return {residence:"现居地",pet_name:"宠物名字",name:"称呼"}[key]||(key.startsWith("food:")?"饮食偏好":key.replace(/^preference:/,""));
 }
+function factDisplay(fact){
+  const prefix="food:";
+  if(!fact.key.startsWith(prefix))return fact.value;
+  const subject=fact.key.slice(prefix.length);
+  if(fact.value.includes(subject))return fact.value;
+  if(/^(不吃|爱吃|喜欢吃|讨厌|喜欢|不喜欢|忌口|过敏)$/.test(fact.value)){
+    if(fact.value==="过敏")return "对"+subject+"过敏";
+    if(fact.value==="忌口")return subject+"：忌口";
+    return fact.value+subject;
+  }
+  return subject+"："+fact.value;
+}
 function card(title,quote){
   const d=el("details","memory-card");d.append(el("summary",null,title),el("p","quote","来源：「"+quote+"」"));return d;
 }
@@ -56,14 +68,14 @@ async function loadMemory(){
   const {facts,events}=await api("/memories");
   const list=$("memory-list");list.replaceChildren(el("h3",null,"偏好与事实"));
   if(!facts.length)list.append(el("p","muted","还没有记下长期偏好。"));
-  for(const f of facts)list.append(card(rememberedTitle(f.key)+" · "+f.value,f.quote));
+  for(const f of facts)list.append(card(rememberedTitle(f.key)+" · "+factDisplay(f),f.quote));
   list.append(el("h3",null,"回访事件"));
   if(!events.length)list.append(el("p","muted","还没有待关注的日子。"));
   for(const e of events)list.append(card(e.label+" · "+e.event_date+" · "+({pending:"待回访",asked:"已问候",resolved:"已聊完或取消"}[e.status]||e.status),e.quote));
 }
 function fill(s){
-  setup=s;$("mode").textContent=s.mode==="mock"?"离线模拟":"OpenAI";$("provider").value=s.mode;$("base").value=s.base_url;$("model").value=s.model;$("timezone").value=s.timezone;$("key").value="";$("demo").hidden=s.mode!=="mock";$("clear-key").disabled=!s.key_set;
-  $("key-info").textContent=(s.key_set?"本次运行已配置。":"本次运行没有配置 Key。")+" Key 不写入数据库；重启后可用环境变量或重新填写。";
+  setup=s;$("mode").textContent=s.mode==="mock"?"离线模拟":"OpenAI";$("provider").value=s.mode;$("base").value=s.base_url;$("model").value=s.model;$("timezone").value=s.timezone;$("key").value="";$("key").placeholder=s.key_set?"••••••••":"输入 OpenAI API Key";$("demo").hidden=s.mode!=="mock";$("clear-key").disabled=!s.key_set;
+  $("key-info").textContent=(s.key_set?"已配置 API Key。留空保存会保留现有 Key。":"未配置 API Key。")+" Key 不写入数据库；重启后可用环境变量或重新填写。";
 }
 async function openChat(demo_date=null){
   const result=await api("/chat/open","POST",demo_date?{demo_date}:{});

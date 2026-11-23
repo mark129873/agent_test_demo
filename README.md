@@ -4,30 +4,23 @@
 
 ## Windows 启动
 
-安装 Python 3.12 或更新版本后，在 PowerShell 中进入项目目录。首次使用时创建虚拟环境并安装依赖：
+先[安装 uv](https://docs.astral.sh/uv/getting-started/installation/)，然后在 PowerShell 中进入项目目录：
 
 ```powershell
 cd "C:\你的路径\agent_test_demo"
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe app.py
+uv run app.py
 ```
 
-如果已有 Windows 虚拟环境，后续启动只需运行最后一行。项目应放在支持 Windows 文件权限的本地 NTFS 文件系统中。程序会为数据库、密钥及相关文件设置仅当前用户和系统可访问的权限；如果已有文件无法应用这些权限，程序会拒绝使用该文件。请确认文件归当前用户所有，并检查所在文件夹的安全设置。
+项目应放在支持 Windows 文件权限的本地 NTFS 文件系统中。程序会为数据库、密钥及相关文件设置仅当前用户和系统可访问的权限；如果已有文件无法应用这些权限，程序会拒绝使用该文件。请确认文件归当前用户所有，并检查所在文件夹的安全设置。
 
 ## macOS 启动
 
-Python 版本：3.12 或更新版本。
+先[安装 uv](https://docs.astral.sh/uv/getting-started/installation/)，然后在终端中运行：
 
 ```bash
 cd /你的路径/agent_test_demo
-python3 --version
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python app.py
+uv run app.py
 ```
-
-
 
 Windows 和 macOS 都在浏览器打开 http://127.0.0.1:8765/ 。保持启动终端打开，按 `Ctrl+C` 停止应用。虚拟环境不能跨系统共用；复制项目到另一种系统时，请重新创建该系统的 `.venv`。
 

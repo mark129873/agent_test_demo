@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,7 +33,7 @@ class CredentialsTests(unittest.TestCase):
             self.assertTrue(client.put("/api/settings/media",json=media).json()["services"]["image"]["saved_key"])
         if os.name == "posix":
             self.assertEqual(self.master.stat().st_mode & 0o777,0o600)
-        with sqlite3.connect(self.path) as con:
+        with closing(sqlite3.connect(self.path)) as con:
             credentials=dict(con.execute("SELECT name,ciphertext FROM credential_values").fetchall())
             self.assertEqual(set(credentials),{"chat","image"})
             self.assertNotIn(chat.encode(),credentials["chat"])

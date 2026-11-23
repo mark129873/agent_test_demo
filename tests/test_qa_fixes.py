@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,7 +91,7 @@ class AppRegressionTests(unittest.IsolatedAsyncioTestCase):
         async def model(*args):
             raise AssertionError("not used")
         c=await self.client(model)
-        with sqlite3.connect(self.path) as con:
+        with closing(sqlite3.connect(self.path)) as con, con:
             mid=con.execute("INSERT INTO messages(role,text,created_at) VALUES('assistant','audio','2026-11-20')").lastrowid
             aid=con.execute("INSERT INTO attachments(message_id,kind,state,mime,body) VALUES(?,'tts','ready','audio/wav',?)",
                             (mid,b"0123456789")).lastrowid
@@ -106,7 +107,7 @@ class HelperRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/"case.sqlite3"
             create_app(p)
-            with sqlite3.connect(p) as con:
+            with closing(sqlite3.connect(p)) as con, con:
                 mid=con.execute("INSERT INTO messages(role,text,created_at) VALUES('assistant','audio','2026-11-20')").lastrowid
                 con.execute("INSERT INTO attachments(message_id,kind,state) VALUES(?,'tts','pending')",(mid,))
             fd=open_private(str(p)+".lock",os.O_RDWR|os.O_CREAT)
@@ -120,7 +121,7 @@ class HelperRegressionTests(unittest.TestCase):
                                  encoding="utf-8",timeout=8)
                 self.assertNotEqual(r.returncode,0)
                 self.assertIn("另一晚灯进程",r.stderr)
-                with sqlite3.connect(p) as con:
+                with closing(sqlite3.connect(p)) as con:
                     self.assertEqual(con.execute("SELECT state FROM attachments").fetchone()[0],"pending")
 
     def test_summary_included_when_recent_messages_are_large(self):

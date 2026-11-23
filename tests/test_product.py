@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -39,7 +40,7 @@ class ProductTests(unittest.IsolatedAsyncioTestCase):
         return client
 
     def saved(self):
-        with sqlite3.connect(self.db) as con:
+        with closing(sqlite3.connect(self.db)) as con:
             epoch, floor, covered, summary = con.execute(
                 "SELECT epoch, floor, covered, summary FROM continuity WHERE id=1"
             ).fetchone()
@@ -427,7 +428,7 @@ class ProductTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("openai", "summary"), calls)
 
     async def test_legacy_single_event_schema_survives_upgrade(self):
-        with sqlite3.connect(self.db) as con:
+        with closing(sqlite3.connect(self.db)) as con, con:
             con.executescript("""
                 CREATE TABLE messages(id INTEGER PRIMARY KEY, role TEXT NOT NULL,
                     text TEXT NOT NULL, created_at TEXT NOT NULL, request_id TEXT UNIQUE,
@@ -670,12 +671,12 @@ class ProductTests(unittest.IsolatedAsyncioTestCase):
         async def model(setup,key,context):
             return {"reply":"saved","patches":[]}
 
-        with sqlite3.connect(self.db):
+        with closing(sqlite3.connect(self.db)) as con, con:
             pass
         os.chmod(self.db, 0o644)
         self.assertEqual(stat.S_IMODE(self.db.stat().st_mode), 0o644)
         client = await self.client(model)
-        with sqlite3.connect(self.db) as observer:
+        with closing(sqlite3.connect(self.db)) as observer, observer:
             observer.execute("BEGIN")
             observer.execute("SELECT * FROM settings").fetchall()
             await self.send(client,"database-private","sensitive text")

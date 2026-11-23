@@ -3,7 +3,7 @@ import unittest
 
 from fastapi import HTTPException
 
-from attachment_http import serve_attachment
+from app.attachment_http import serve_attachment
 
 
 class AttachmentHTTPTests(unittest.TestCase):

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from quiet_topics import (QUIET_SCHEMA, active_quiet_topics, contains_quiet_topic,
+from app.quiet_topics import (QUIET_SCHEMA, active_quiet_topics, contains_quiet_topic,
                           filter_context, remember_quiet_topics)
 
 

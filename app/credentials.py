@@ -5,6 +5,8 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .platform_files import open_private
+
 
 class CredentialStoreError(Exception):
     pass
@@ -18,12 +20,12 @@ class Credentials:
     def _cipher(self, create=False):
         try:
             try:
-                fd=os.open(self.path,os.O_RDONLY|os.O_NOFOLLOW)
+                fd=open_private(self.path,os.O_RDONLY,fix_permissions=False)
             except FileNotFoundError:
                 if not create:
                     raise
                 try:
-                    fd=os.open(self.path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                    fd=open_private(self.path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,fix_permissions=False)
                 except FileExistsError:
                     return self._cipher()
                 key=Fernet.generate_key()
@@ -32,7 +34,7 @@ class Credentials:
                 return Fernet(key)
             with os.fdopen(fd,"rb") as f:
                 status=os.fstat(f.fileno())
-                if not stat.S_ISREG(status.st_mode) or status.st_mode&0o077:
+                if not stat.S_ISREG(status.st_mode) or (os.name != "nt" and status.st_mode&0o077):
                     raise CredentialStoreError("Key 加密文件权限不安全，请将权限设为 600。")
                 return Fernet(f.read(128))
         except (OSError,ValueError) as exc:

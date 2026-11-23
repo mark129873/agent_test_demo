@@ -1,6 +1,5 @@
 """Reproductions for the published baseline's targeted QA findings."""
 import asyncio
-import fcntl
 import os
 import sqlite3
 import subprocess
@@ -12,9 +11,15 @@ from pathlib import Path
 
 import httpx
 
-from agent import ModelFailure, candidates
+from app.agent import ModelFailure, candidates
 from app import create_app
-from continuity import assemble, payload_bytes
+from app.continuity import assemble, payload_bytes
+from app.platform_files import open_private
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 START = datetime(2026,11,20,12,tzinfo=timezone.utc)
 
@@ -104,10 +109,15 @@ class HelperRegressionTests(unittest.TestCase):
             with sqlite3.connect(p) as con:
                 mid=con.execute("INSERT INTO messages(role,text,created_at) VALUES('assistant','audio','2026-11-20')").lastrowid
                 con.execute("INSERT INTO attachments(message_id,kind,state) VALUES(?,'tts','pending')",(mid,))
-            with open(str(p)+".lock","wb") as owner:
-                fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                r=subprocess.run([sys.executable,"app.py"],env={**os.environ,"COMPANION_DB":str(p)},
-                                 capture_output=True,text=True,timeout=8)
+            fd=open_private(str(p)+".lock",os.O_RDWR|os.O_CREAT)
+            with os.fdopen(fd,"r+b") as owner:
+                if os.name == "nt":
+                    msvcrt.locking(owner.fileno(),msvcrt.LK_NBLCK,1)
+                else:
+                    fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                r=subprocess.run([sys.executable,"app.py"],env={**os.environ,"COMPANION_DB":str(p),
+                                 "PYTHONIOENCODING":"utf-8"},capture_output=True,text=True,
+                                 encoding="utf-8",timeout=8)
                 self.assertNotEqual(r.returncode,0)
                 self.assertIn("另一晚灯进程",r.stderr)
                 with sqlite3.connect(p) as con:

@@ -14,7 +14,9 @@ import httpx
 from PIL import Image
 
 from app import create_app
-from media import MediaFailure, align_photo_reply, audio_reply, image_prompt, intent, openai_media, pcm_wav, text_only_turn, tone_for
+from app.agent import respond
+from app.media import (MediaFailure, align_photo_reply, audio_reply, image_prompt,
+                          intent, openai_media, pcm_wav, text_only_turn, tone_for)
 
 SAMPLE_AUDIO=pcm_wav(b"\x00\x00"*1000)
 
@@ -47,18 +49,47 @@ class ImageTransportTests(unittest.IsolatedAsyncioTestCase):
 
         transport = httpx.MockTransport(response)
         async_client = httpx.AsyncClient(transport=transport)
-        with patch("media.httpx.AsyncClient",return_value=async_client):
+        with patch("app.media.httpx.AsyncClient",return_value=async_client):
             return await openai_media("image",{"base_url":"https://api.openai.com/v1","model":"synthetic-img"},
                                       "synthetic-key",{"scene":"home","detail":"雨窗饺子"})
 
     async def test_accepts_decodable_jpeg(self):
         self.assertEqual(await self.render(SAMPLE_JPEG),("image/jpeg",SAMPLE_JPEG))
 
+    async def test_image_request_contains_the_requested_visual_details(self):
+        def response(request):
+            payload=json.loads(request.content)
+            self.assertIn("蓝色鲸鱼",payload["prompt"])
+            self.assertIn("紫色雪山",payload["prompt"])
+            self.assertNotIn("预约人李小周",payload["prompt"])
+            return httpx.Response(200,json={"data":[{"b64_json":base64.b64encode(SAMPLE_JPEG).decode()}]})
+        transport=httpx.MockTransport(response)
+        client=httpx.AsyncClient(transport=transport)
+        with patch("app.media.httpx.AsyncClient",return_value=client):
+            await openai_media("image",{"base_url":"https://api.openai.com/v1","model":"synthetic-img"},
+                "synthetic-key",{"scene":"home","detail":"","visual_request":
+                "发一张蓝色鲸鱼飞过紫色雪山的照片，不要提及预约人李小周"})
+
     async def test_rejects_header_only_truncated_or_oversized_jpeg(self):
         for jpeg in (b"\xff\xd8\xff\xdbTEST\xff\xd9", SAMPLE_JPEG[:-2],
                      SAMPLE_JPEG[:200]+b"\xff\xd9",make_jpeg_bytes((4097,1))):
             with self.subTest(length=len(jpeg)), self.assertRaisesRegex(MediaFailure,"没有返回有效结果"):
                 await self.render(jpeg)
+
+
+class ImageChatModelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_model_description_is_preserved(self):
+        def response(request):
+            request_body=json.loads(request.content)
+            self.assertIn("photo_description",request_body["messages"][0]["content"])
+            content={"reply":"夜空真美。","patches":[],"photo_scene":"share",
+                     "photo_description":"湖面上空的紫色极光。"}
+            return httpx.Response(200,json={"choices":[{"message":{"content":json.dumps(content,ensure_ascii=False)}}]})
+        client=httpx.AsyncClient(transport=httpx.MockTransport(response))
+        with patch("app.agent.httpx.AsyncClient",return_value=client):
+            result=await respond({"mode":"openai","base_url":"https://api.openai.com/v1","model":"test"},
+                                 "synthetic-key",{"type":"user_message","message":"湖面上有极光"})
+        self.assertEqual(result["photo_description"],"湖面上空的紫色极光。")
 
 
 class AudioTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -108,9 +139,9 @@ class AudioTransportTests(unittest.IsolatedAsyncioTestCase):
                 driver.attempts.append((url,kwargs))
                 return Socket()
 
-        self.enterContext(patch("media.aiohttp.ClientSession", Session))
-        self.proxies = self.enterContext(patch("media.getproxies", return_value={"https":"http://proxy.test:3128"}))
-        self.bypass = self.enterContext(patch("media.proxy_bypass", return_value=False))
+        self.enterContext(patch("app.media.aiohttp.ClientSession", Session))
+        self.proxies = self.enterContext(patch("app.media.getproxies", return_value={"https":"http://proxy.test:3128"}))
+        self.bypass = self.enterContext(patch("app.media.proxy_bypass", return_value=False))
 
     async def speak(self):
         return await audio_reply(self.setup, "synthetic-token", "饺子今晚又赢了。", "bright")
@@ -198,7 +229,7 @@ class ActualProxyTests(unittest.IsolatedAsyncioTestCase):
         loop.set_exception_handler(lambda _loop, context: failures.append(context))
         async with proxy:
             port = proxy.sockets[0].getsockname()[1]
-            with patch("media.getproxies",return_value={"https":f"http://127.0.0.1:{port}"}), patch("media.proxy_bypass",return_value=False):
+            with patch("app.media.getproxies",return_value={"https":f"http://127.0.0.1:{port}"}), patch("app.media.proxy_bypass",return_value=False):
                 with self.assertRaisesRegex(MediaFailure,"无法建立连接"):
                     await audio_reply({"base_url":"https://api.openai.com/v1","model":"gpt-realtime-2.1-mini"},
                                       "synthetic-token","synthetic text","warm")
@@ -237,7 +268,8 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             text=context.get("message","")
             self.chat_context=context
             return {"reply":getattr(self,"chat_reply","我陪你坐一会儿。"),"patches":[],
-                    "photo_scene":"meal" if "晚饭" in text else None}
+                    "photo_scene":getattr(self,"chat_photo_scene","meal" if "晚饭" in text else None),
+                    "photo_description":getattr(self,"chat_photo_description","")}
 
         self.app=create_app(self.db,model_call=fake_chat,media_call=fake_media)
         self.client=httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app),base_url="http://test",trust_env=False)
@@ -349,10 +381,9 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((failed["text"],failed["attachments"][0]["state"]),(scheduled["text"],"failed"))
         self.assertEqual([call[0] for call in self.calls],["image","image"])
 
-    async def test_full_local_storage_degrades_and_confirmed_removal_recovers(self):
-        from unittest.mock import patch
+    async def test_full_local_storage_preserves_attachments_and_text_chat(self):
         await self.configure()
-        with patch("app.MAX_MEDIA_STORAGE",len(SAMPLE_JPEG)):
+        with patch("app.server.MAX_MEDIA_STORAGE",len(SAMPLE_JPEG)):
             await self.message("给我发一张照片。","storage-photo-1")
             first=(await self.attached())[-1]
             aid=first["attachments"][0]["id"]
@@ -361,13 +392,13 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("媒体空间已满",blocked["attachments"][0]["error"])
             self.assertTrue(blocked["text"])
             self.assertEqual([c[0] for c in self.calls],["image"])
-            removed=(await self.client.delete(f"/api/attachments/{aid}")).json()
-            self.assertTrue(removed["removed"])
-            self.assertEqual(removed["messages"][0]["text"],first["text"])
-            self.assertEqual(removed["messages"][0]["attachments"][0]["state"],"removed")
-            self.assertEqual((await self.client.get(f"/api/attachments/{aid}")).status_code,404)
-            await self.message("给我发张照片。","storage-photo-3")
-            self.assertEqual((await self.attached())[-1]["attachments"][0]["state"],"ready")
+            path=f"/api/attachments/{aid}"
+            self.assertEqual((await self.client.delete(path)).status_code,405)
+            asset=await self.client.get(path)
+            self.assertEqual((asset.status_code,asset.content),(200,SAMPLE_JPEG))
+            chat=await self.message("我们接着聊吧。","storage-text-3")
+            self.assertTrue(chat["text"])
+            self.assertEqual(chat["attachments"],[])
 
     async def test_failure_isolation_and_no_key_leak(self):
         cfg=await self.configure("both")
@@ -432,7 +463,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((payload["scene"],payload["detail"]),("meal","番茄牛肉饭"))
         self.assertIn("番茄牛肉饭",image_prompt(payload["scene"],payload["detail"]))
 
-    async def test_window_photo_is_explicit_and_uses_allowlisted_composition(self):
+    async def test_window_photo_uses_requested_details_without_private_info(self):
         await self.configure()
         wanted = "可以发张你想象中的窗边给我看看吗？就素净一点，雨窗和一小盘饺子，照片不要加字"
         cases = (
@@ -447,7 +478,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([(a["kind"], a["state"]) for a in last["attachments"]], [("image", "ready")])
             self.assertEqual(len(self.calls), i + 1)
             payload = self.calls[-1][2]
-            self.assertEqual(payload, {"scene": "home", "detail": detail})
+            self.assertEqual((payload["scene"],payload["detail"]), ("home",detail))
             prompt = image_prompt(**payload)
             self.assertNotIn("李小周", prompt)
             self.assertIn("窗", prompt)
@@ -457,6 +488,74 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("雨滴", prompt)
                 self.assertIn("一小盘饺子", prompt)
         self.assertNotIn("李小周", image_prompt("home", "把李小周画进去"))
+
+    async def test_explicit_image_uses_arbitrary_current_scene(self):
+        await self.configure()
+        await self.message("发一张蓝色鲸鱼飞过紫色雪山的照片。", "photo-unusual-scene")
+        await self.attached()
+        payload=self.calls[-1][2]
+        prompt=image_prompt(**payload)
+        self.assertIn("蓝色鲸鱼",prompt)
+        self.assertIn("紫色雪山",prompt)
+        self.assertNotIn("温暖的小台灯",prompt)
+
+    async def test_selfie_at_window_does_not_forbid_the_character(self):
+        await self.configure()
+        await self.message("发一张你在窗边看书的自拍。", "photo-window-selfie")
+        await self.attached()
+        prompt=image_prompt(**self.calls[-1][2])
+        self.assertIn("窗边",prompt)
+        self.assertIn("自拍",prompt)
+        self.assertIn("虚构角色的外观",prompt)
+        self.assertNotIn("不出现人物或人像",prompt)
+
+    async def test_generic_image_request_uses_recent_filtered_conversation(self):
+        await self.configure()
+        await self.message("我刚看到湖面上有紫色极光。", "photo-recent-scene")
+        await self.message("发张照片看看。", "photo-recent-request")
+        await self.attached()
+        prompt=image_prompt(**self.calls[-1][2])
+        self.assertIn("紫色极光",prompt)
+        self.assertIn("湖面",prompt)
+
+    async def test_new_image_request_takes_priority_over_previous_scene(self):
+        await self.configure()
+        await self.message("我刚才在森林里散步。", "photo-old-scene")
+        await self.message("发张月球上金色风筝的照片。", "photo-new-scene")
+        await self.attached()
+        prompt=image_prompt(**self.calls[-1][2])
+        self.assertIn("月球",prompt)
+        self.assertIn("金色风筝",prompt)
+        self.assertNotIn("森林",prompt)
+
+    async def test_muted_topic_is_not_used_in_image_context(self):
+        await self.configure()
+        await self.message("刚看到海边的蓝色浪花。", "photo-quiet-safe")
+        await self.message("今晚不要再提同事那件事。", "photo-quiet-request")
+        self.chat_photo_description="同事在办公室里。"
+        self.chat_reply="我试试看。"
+        await self.message("发张照片看看。", "photo-quiet-image")
+        await self.attached()
+        prompt=image_prompt(**self.calls[-1][2])
+        self.assertNotIn("同事",prompt)
+        self.assertIn("蓝色浪花",prompt)
+
+    async def test_proactive_image_can_match_a_new_kind_of_scene(self):
+        await self.configure(proactive=True)
+        self.chat_photo_scene="share"
+        self.chat_photo_description="湖面上方的紫色极光。"
+        self.chat_reply="湖边的极光真美。"
+        await self.message("我在湖边看紫色极光。", "photo-new-proactive")
+        self.assertEqual((await self.attached())[-1]["attachments"][0]["state"],"ready")
+        self.assertIn("紫色极光",image_prompt(**self.calls[-1][2]))
+
+    async def test_proactive_image_requires_a_related_subject(self):
+        await self.configure(proactive=True)
+        self.chat_photo_scene="share"
+        self.chat_photo_description="海边的橙色晚霞。"
+        self.chat_reply="你好呀。"
+        self.assertEqual((await self.message("你好。", "photo-unrelated-proactive"))["attachments"],[])
+        self.assertEqual(self.calls,[])
 
     async def test_window_photo_nonrequests_do_not_bill_generation(self):
         await self.configure(proactive=True)

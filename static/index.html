@@ -29,7 +29,6 @@
     <div id="chat-setup" class="chat-setup" hidden><span id="chat-setup-text"></span><button type="button" id="go-settings" class="secondary">前往设置</button></div>
     <div id="rec-status" class="rec-status" role="status" hidden></div>
     <div id="rec-preview" class="rec-preview" hidden>
-      <audio id="draft-audio" controls aria-label="录音预听"></audio>
       <button type="button" id="discard-audio" class="secondary">丢弃录音</button>
       <button type="button" id="send-audio">发送语音</button>
     </div>
@@ -65,7 +64,8 @@
     <section class="media-settings" aria-labelledby="media-title">
       <h3 id="media-title">语音与媒体</h3>
       <p class="muted">启用后，阿晚可以发语音或照片。语音是晚灯生成的角色配音，不是真人录音。调用可能产生费用。</p>
-      <p class="muted">本地媒体最多保存 384 MiB，不占用文字聊天的空间。达到上限时不会自动删除已有附件；你可以在聊天中移除不再需要的附件，原文字仍会保留。</p>
+      <p class="muted">生成照片时，当前要求和相关对话片段会作为画面参考发送给图片服务。</p>
+      <p class="muted">本地媒体最多保存 384 MiB。达到上限后，可以继续文字聊天和查看已有附件。</p>
       <form id="media-config">
         <label>接收回复<select id="reply-mode"><option value="text">只收文字</option><option value="voice">只收语音</option><option value="both">文字与语音</option></select></label>
         <label class="check"><input type="checkbox" id="proactive-images">允许阿晚偶尔主动分享照片</label>

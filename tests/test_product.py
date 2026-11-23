@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 from httpx import ASGITransport, AsyncClient
 
-from agent import ModelFailure, simulate
+from app.agent import ModelFailure, simulate
 from app import create_app
-from continuity import CONTEXT_BUDGET, RECENT_TURNS, SUMMARY_BATCH
+from app.continuity import CONTEXT_BUDGET, RECENT_TURNS, SUMMARY_BATCH
 
 
 START = datetime(2026, 11, 20, 10, tzinfo=timezone.utc)

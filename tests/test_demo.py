@@ -5,8 +5,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from agent import ModelFailure, respond
 from app import create_app
+from app.agent import ModelFailure, respond
 
 START = datetime(2026,11,20,10,tzinfo=timezone.utc)
 

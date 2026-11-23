@@ -103,11 +103,6 @@ function renderMessages({stick=false, preserve=false, arrived=false}={}){
         focusReplacement=block.querySelector("summary")||block.querySelector(".bubble");
         if(focusReplacement&&focusReplacement.tagName!=="SUMMARY")focusReplacement.tabIndex=-1;
       }
-      if(focused?.dataset.removeAttachmentId&&entry?.block.contains(focused)){
-        const wasRemoved=[...block.querySelectorAll("[data-removed-attachment-id]")]
-          .find(marker=>marker.dataset.removedAttachmentId===focused.dataset.removeAttachmentId);
-        if(wasRemoved)focusReplacement=wasRemoved;
-      }
       entry={line,block,signature};renderedRows.set(key,entry);
     }
     if(row.role==="user"){

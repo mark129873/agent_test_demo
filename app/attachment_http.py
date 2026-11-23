@@ -69,7 +69,6 @@ def serve_attachment(
     if head:
         return Response(media_type=media_type, headers={**headers, "Content-Length": str(size)})
 
-    # Recheck state: the attachment may have been removed since the metadata read.
     if bounds is None:
         body = con.execute(
             "SELECT body FROM attachments WHERE id=? AND state='ready'", (attachment_id,)

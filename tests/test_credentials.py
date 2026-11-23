@@ -30,7 +30,8 @@ class CredentialsTests(unittest.TestCase):
             media=client.get("/api/settings/media").json()
             media["services"]["image"]["api_key"]=image
             self.assertTrue(client.put("/api/settings/media",json=media).json()["services"]["image"]["saved_key"])
-        self.assertEqual(self.master.stat().st_mode & 0o777,0o600)
+        if os.name == "posix":
+            self.assertEqual(self.master.stat().st_mode & 0o777,0o600)
         with sqlite3.connect(self.path) as con:
             credentials=dict(con.execute("SELECT name,ciphertext FROM credential_values").fetchall())
             self.assertEqual(set(credentials),{"chat","image"})
